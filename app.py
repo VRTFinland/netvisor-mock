@@ -94,11 +94,6 @@ def get_customer_list():
     return generate_customerlist_response(keyword)
 
 
-@app.route("/customer.nv", methods=["GET"])
-def get_customer():
-    customer_id = request.args.get("id")
-
-
 @app.route("/customer.nv", methods=["POST"])
 def create_customer():
     payload = xmltodict.parse(request.data)
