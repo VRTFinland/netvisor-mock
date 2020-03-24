@@ -15,13 +15,22 @@ app = Flask(__name__)
 class NetvisorData:
 
     def __init__(self):
-        with open('data.json', 'r') as fh:
-            data = json.loads(fh.read())
-            self.customers = data.get("customers", {})
-            self.salesinvoices = data.get("salesinvoices", {})
-            self.customer_count = data.get("customersCount", 0)
-            self.salesinvoice_count = data.get("salesinvoicesCount", 0)
-            self.businessIdCustomerMap = data.get("businessIdCustomerMap", {})
+        data = self.read_data_json()
+        self.customers = data.get("customers", {})
+        self.salesinvoices = data.get("salesinvoices", {})
+        self.customer_count = data.get("customersCount", 0)
+        self.salesinvoice_count = data.get("salesinvoicesCount", 0)
+        self.businessIdCustomerMap = data.get("businessIdCustomerMap", {})
+
+    def read_data_json(self):
+        """Create data.json -file if it doesn't exist."""
+
+        if os.path.isfile("data.json"):
+            with open('data.json', 'r') as fh:
+                data = json.loads(fh.read())
+                return data
+        else:
+            return self.reset_data()
 
     def reset_data(self):
         self.customers = {}
@@ -38,7 +47,8 @@ class NetvisorData:
                 "salesinvoicesCount": self.salesinvoice_count,
                 "businessIdCustomerMap": self.businessIdCustomerMap
             }
-            fh.write(json.dumps(data))
+            fh.write(json.dumps(data, indent=4))
+            return data
 
     def write_data(self):
         with open('data.json', 'w') as fh:
@@ -121,7 +131,6 @@ def get_salesinvoice():
 def post_salesinvoice():
     if request.args.get("method") == "add":
         payload = xmltodict.parse(request.data)
-        print(payload)
         salesinvoice_id = netvisorData.add_salesinvoice(payload)
         return generate_inserted_data_response(salesinvoice_id)
     else:
@@ -129,7 +138,6 @@ def post_salesinvoice():
 
 
 def generate_customer_element(customer, key):
-    print(customer)
     return E.Customer(
         E.Netvisorkey(key),
         E.Name(customer.get("name", "")),
