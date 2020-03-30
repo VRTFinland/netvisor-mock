@@ -137,6 +137,20 @@ def post_salesinvoice():
         return Response(None, status=204)
 
 
+def update_salesinvoice_status(netvisor_key, status):
+    salesinvoice = netvisorData.salesinvoices.get(netvisor_key)
+    salesinvoice.get("salesinvoicestatus", {})["#text"] = status
+
+
+@app.route("/updatesalesinvoicestatus.nv", methods=["POST"])
+def post_salesinvoicestatus():
+    netvisor_key = request.args.get("netvisorkey")
+    status = request.args.get("status")
+
+    update_salesinvoice_status(netvisor_key, status)
+    return generate_inserted_data_response(netvisor_key)
+
+
 def generate_customer_element(customer, key):
     return E.Customer(
         E.Netvisorkey(key),
