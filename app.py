@@ -176,7 +176,7 @@ def generate_customerlist_response(keyword: str) -> str:
                 generate_customer_element(value.get("customerbaseinformation"), key)
             )
         else:
-            if value.get("customerbaseinformation").get("externalidentifier") == keyword:
+            if value.get("customerbaseinformation").get("externalidentifier").startswith(keyword):
                 customer_list.append(
                     generate_customer_element(value.get("customerbaseinformation"), key)
                 )
