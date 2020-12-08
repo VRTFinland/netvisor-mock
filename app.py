@@ -253,7 +253,7 @@ def generate_salesinvoice(netvisor_key, pdf_image):
             E.InvoicingCustomerAddressLine(customer.get("streetaddress", "")),
             E.InvoicingCustomerAdditionalAddressLine(customer.get("additionaladdressline", "")),
             E.InvoicingCustomerPostnumber(customer.get("postnumber", "")),
-            E.InvoicingCustomerTown(customer.get("city")),
+            E.InvoicingCustomerTown(customer.get("city", "")),
             E.InvoicingCustomerCountryCode("FINLAND"),
             E.MatchPartialPaymentsByDefault("No"),
         )
