@@ -8,8 +8,10 @@ from lxml.builder import E
 from datetime import datetime
 
 from flask import Flask, request, Response
+from payroll_mock import payroll
 
 app = Flask(__name__)
+app.register_blueprint(payroll)
 
 
 class NetvisorData:
