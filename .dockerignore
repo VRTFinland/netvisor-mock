@@ -1,6 +1,7 @@
 .git
 __pycache__
 *.pyc
-test_payroll.py
 .venv
 .ruff_cache
+test_*.py
+payroll_test_support.py
