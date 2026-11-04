@@ -4,3 +4,4 @@ __pycache__
 *.py[co]
 .venv
 .ruff_cache
+data.json.tmp

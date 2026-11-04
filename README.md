@@ -69,15 +69,22 @@ $ uv run flask run -p 5001
 ## Development
 
 ```
-$ uv run ruff check        # lint
-$ uv run ruff format       # format
-$ uv run ty check          # type check
-$ uv run python -m unittest
+$ make check               # ruff, ty and the tests (make help lists the targets)
+$ make format              # fix lint findings and format
 ```
 
 ## Docker
 
 ```
-$ docker build -t netvisor-mock .
-$ docker run -p 5001:5001 netvisor-mock
+$ make build               # vrtfinland/netvisor-mock:dev for this machine
+$ docker run -p 5001:5001 vrtfinland/netvisor-mock:dev
+```
+
+Publishing builds `linux/amd64` and `linux/arm64` with `docker buildx` and pushes them as one tag.
+It needs a builder with the `docker-container` driver and push access to `vrtfinland/netvisor-mock`.
+The target refuses an uncommitted tree or an existing tag:
+
+```
+$ docker buildx create --name multiarch --driver docker-container   # once
+$ make publish TAG=6 BUILDER=multiarch
 ```

@@ -517,5 +517,83 @@ class SalesInvoiceErrorsTest(AppTestCase):
         self.write_data.assert_called_once()
 
 
+class RobustnessTest(AppTestCase):
+    """Malformed or legacy data answers INVALID_DATA or is tolerated; it never stores half a request or a 500."""
+
+    def test_malformed_or_incomplete_customer_is_rejected_without_storing(self):
+        for body in (
+            b"<root><customer>",
+            b"<root><customer/></root>",
+            b"<root><customer><customerbaseinformation/></customer></root>",
+            b"<other/>",
+        ):
+            response = self.client.post("/customer.nv?method=add", data=body)
+            self.assertEqual(response.status_code, 400, body)
+            self.assertEqual(statuses(response.data)[0], "FAILED")
+        self.assertEqual((netvisorData.customers, netvisorData.customer_count), ({}, 0))
+        self.write_data.assert_not_called()
+
+    def test_malformed_salesinvoice_is_rejected_without_storing(self):
+        response = self.client.post("/salesinvoice.nv?method=add", data=b"<root><salesinvoice>")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(netvisorData.salesinvoices, {})
+
+    def test_listing_and_invoices_tolerate_a_stored_customer_without_base_information(self):
+        netvisorData.customers["1"] = None
+        netvisorData.customers["2"] = {"customerbaseinformation": None}
+        key = self.add_salesinvoice()
+
+        self.assertEqual(self.client.get("/customerlist.nv?keyword=x").status_code, 200)
+        self.assertEqual(len(parse(self.client.get("/customerlist.nv").data).findall("Customerlist/Customer")), 2)
+        self.assertEqual(self.client.get("/getcustomer.nv?idlist=1,2").status_code, 200)
+        self.assertEqual(self.client.get(f"/getsalesinvoice.nv?netvisorkey={key}").status_code, 200)
+
+    def test_repeated_element_uses_its_first_occurrence(self):
+        self.add_customer(CUSTOMER_PORT.replace(b"<name>Port Oy</name>", b"<name>Port Oy</name><name>Other</name>"))
+
+        self.assertEqual(
+            parse(self.client.get("/customerlist.nv").data).findtext("Customerlist/Customer/Name"), "Port Oy"
+        )
+
+    def test_status_update_works_without_or_with_an_attribute_less_status_element(self):
+        for invoice in (
+            SALESINVOICE.replace(b'<salesinvoicestatus type="netvisor">open</salesinvoicestatus>', b""),
+            SALESINVOICE.replace(b' type="netvisor">open<', b">open<"),
+        ):
+            key = self.add_salesinvoice(invoice)
+            response = self.client.post(f"/updatesalesinvoicestatus.nv?netvisorkey={key}&status=paid")
+            self.assertEqual(response.status_code, 200)
+            status = parse(self.client.get(f"/getsalesinvoice.nv?netvisorkey={key}").data).find(
+                "SalesInvoice/InvoiceStatus"
+            )
+            assert status is not None
+            self.assertEqual(status.get("status"), "paid")
+
+    def test_control_characters_in_query_values_answer_invalid_data(self):
+        for path in ("/getcustomer.nv?id=%00", "/updatesalesinvoicestatus.nv?netvisorkey=%01&status=open"):
+            response = self.client.open(path, method="POST" if "update" in path else "GET")
+            self.assertEqual(response.status_code, 400, path)
+            self.assertEqual(statuses(response.data)[0], "FAILED")
+
+    def test_edit_moves_the_business_id_mapping(self):
+        self.add_customer(CUSTOMER_PORT)
+
+        self.client.post("/customer.nv?method=edit&id=1", data=CUSTOMER_SHIP)
+
+        self.assertEqual(netvisorData.businessIdCustomerMap, {"7654321-0": "1"})
+
+    def test_write_is_atomic(self):
+        real_write = NetvisorData.write_data.__get__(netvisorData)
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            contextlib.chdir(tmp),
+            patch.object(netvisorData, "write_data", real_write),
+        ):
+            self.add_customer()
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["data.json"])
+            self.assertIn("1", json.loads(Path("data.json").read_text())["customers"])
+
+
 if __name__ == "__main__":
     unittest.main()

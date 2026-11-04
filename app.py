@@ -1,7 +1,11 @@
 import base64
+import functools
 import json
 import os
+import re
+import threading
 from datetime import date, datetime
+from xml.parsers.expat import ExpatError
 from zoneinfo import ZoneInfo
 
 import xmltodict
@@ -62,38 +66,75 @@ class NetvisorData:
         return self.snapshot()
 
     def write_data(self):
-        with open("data.json", "w") as fh:
+        # Write and rename, so an interrupted write never leaves a truncated data.json behind.
+        with open("data.json.tmp", "w") as fh:
             fh.write(json.dumps(self.snapshot(), indent=4))
+        os.replace("data.json.tmp", "data.json")
 
-    def add_customer(self, payload):
+    def _map_business_id(self, customer_id, customer):
+        self.businessIdCustomerMap = {
+            business_id: key for business_id, key in self.businessIdCustomerMap.items() if key != customer_id
+        }
+        business_id = text_of(base_information(customer).get("externalidentifier"))
+        if business_id:
+            self.businessIdCustomerMap[business_id] = customer_id
+
+    def add_customer(self, customer):
         self.customer_count += 1
         customer_id = str(self.customer_count)
-        self.customers[customer_id] = payload.get("root").get("customer")
-        business_id = payload.get("root").get("customer").get("customerbaseinformation").get("externalidentifier")
-        self.businessIdCustomerMap[business_id] = customer_id
+        self.customers[customer_id] = customer
+        self._map_business_id(customer_id, customer)
         self.customer_changed[customer_id] = netvisor_now()
         self.write_data()
         return customer_id
 
-    def edit_customer(self, customer_id, payload):
-        self.customers[customer_id] = payload.get("root").get("customer")
+    def edit_customer(self, customer_id, customer):
+        self.customers[customer_id] = customer
+        self._map_business_id(customer_id, customer)
         self.customer_changed[customer_id] = netvisor_now()
         self.write_data()
         return customer_id
 
-    def add_salesinvoice(self, payload):
+    def add_salesinvoice(self, salesinvoice):
         self.salesinvoice_count += 1
         salesinvoice_id = str(self.salesinvoice_count)
-        self.salesinvoices[salesinvoice_id] = payload.get("root").get("salesinvoice")
+        self.salesinvoices[salesinvoice_id] = salesinvoice
         self.write_data()
         return salesinvoice_id
 
 
 netvisorData = NetvisorData()
 BASE_URL = os.environ.get("BASE_URL", "http://0.0.0.0:5001")
+# The dev server is threaded; every invoicing request reads or writes netvisorData under this lock.
+_data_lock = threading.RLock()
+
+
+def synchronized(view):
+    @functools.wraps(view)
+    def locked(*args, **kwargs):
+        with _data_lock:
+            return view(*args, **kwargs)
+
+    return locked
+
+
+def parse_resource(resource, required_section=None):
+    """The <root><resource> element of the request body as xmltodict data, or a FAILED response."""
+    try:
+        payload = xmltodict.parse(request.data)
+    except ExpatError:
+        return None, generate_failed_response("INVALID_DATA :: Data form incorrect:. Invalid XML document")
+    root_element = payload.get("root") if isinstance(payload, dict) else None
+    data = root_element.get(resource) if isinstance(root_element, dict) else None
+    if not isinstance(data, dict) or (required_section and not isinstance(data.get(required_section), dict)):
+        return None, generate_failed_response(
+            f"INVALID_DATA :: Data form incorrect:. Missing {required_section or resource}"
+        )
+    return data, None
 
 
 @app.route("/reset", methods=["POST"])
+@synchronized
 def reset():
     netvisorData.reset_data()
     return Response(None, status=204)
@@ -105,6 +146,7 @@ def root():
 
 
 @app.route("/customerlist.nv", methods=["GET"])
+@synchronized
 def get_customer_list():
     keyword = request.args.get("keyword")
     changed_since = None
@@ -133,6 +175,7 @@ def parse_changed_since(value: str) -> str | None:
 
 
 @app.route("/customer.nv", methods=["POST"])
+@synchronized
 def create_customer():
     # Texts as the Netvisor sandbox answered on 2026-11-05; "method missing" follows the "id missing" wording.
     method = request.args.get("method")
@@ -150,15 +193,18 @@ def create_customer():
             f"INVALID_DATA :: Data form incorrect:. Cannot be updated. Customer not found, ID: {customer_id}"
         )
 
-    payload = xmltodict.parse(request.data)
+    customer, error = parse_resource("customer", "customerbaseinformation")
+    if error:
+        return error
     if method == "add":
-        customer_id = netvisorData.add_customer(payload)
+        customer_id = netvisorData.add_customer(customer)
     else:
-        netvisorData.edit_customer(customer_id, payload)
+        netvisorData.edit_customer(customer_id, customer)
     return generate_inserted_data_response(customer_id)
 
 
 @app.route("/getcustomer.nv", methods=["GET"])
+@synchronized
 def get_customer():
     requested = request.args.get("idlist") or request.args.get("id")
     if not requested:
@@ -177,6 +223,7 @@ def get_customer():
 
 
 @app.route("/getsalesinvoice.nv", methods=["GET"])
+@synchronized
 def get_salesinvoice():
     netvisor_key = request.args.get("netvisorkey")
     pdf_image = request.args.get("pdfimage")
@@ -185,13 +232,14 @@ def get_salesinvoice():
 
 
 @app.route("/salesinvoice.nv", methods=["POST"])
+@synchronized
 def post_salesinvoice():
-    if request.args.get("method") == "add":
-        payload = xmltodict.parse(request.data)
-        salesinvoice_id = netvisorData.add_salesinvoice(payload)
-        return generate_inserted_data_response(salesinvoice_id)
-    else:
+    if request.args.get("method") != "add":
         return Response(None, status=204)
+    salesinvoice, error = parse_resource("salesinvoice")
+    if error:
+        return error
+    return generate_inserted_data_response(netvisorData.add_salesinvoice(salesinvoice))
 
 
 # Documented values for updatesalesinvoicestatus.nv; the Netvisor sandbox rejects e.g. "unsent".
@@ -199,6 +247,7 @@ SALESINVOICE_STATUSES = {"open", "overdue", "reminded", "requested", "collected"
 
 
 @app.route("/updatesalesinvoicestatus.nv", methods=["POST"])
+@synchronized
 def post_salesinvoicestatus():
     netvisor_key = request.args.get("netvisorkey")
     status = request.args.get("status")
@@ -207,12 +256,14 @@ def post_salesinvoicestatus():
     if status not in SALESINVOICE_STATUSES:
         return generate_failed_response("INVALID_DATA :: Data form incorrect:. Invalid invoice status")
     salesinvoice = netvisorData.salesinvoices.get(netvisor_key)
-    if salesinvoice is None:
+    if not isinstance(salesinvoice, dict):
         return generate_failed_response(
             f"INVALID_DATA :: Data form incorrect:. No invoice found for the given ID, ID: {netvisor_key}"
         )
 
-    salesinvoice.get("salesinvoicestatus", {})["#text"] = status
+    # Keep the imported attributes (e.g. type="netvisor"); the element may be missing or attribute-less.
+    previous = salesinvoice.get("salesinvoicestatus")
+    salesinvoice["salesinvoicestatus"] = {**(previous if isinstance(previous, dict) else {}), "#text": status}
     netvisorData.write_data()
     return generate_inserted_data_response(netvisor_key)
 
@@ -241,11 +292,11 @@ def generate_customer_element(customer, key):
 
 def generate_customer_details(key, stored):
     """One getcustomer.nv <Customer> with the sections and element names the sandbox returned on 2026-11-05."""
-    base = stored.get("customerbaseinformation") or {}
-    finvoice = stored.get("customerfinvoicedetails") or {}
-    delivery = stored.get("customerdeliverydetails") or {}
-    contact = stored.get("customercontactdetails") or {}
-    additional = stored.get("customeradditionalinformation") or {}
+    base = base_information(stored)
+    finvoice = base_information(stored, "customerfinvoicedetails")
+    delivery = base_information(stored, "customerdeliverydetails")
+    contact = base_information(stored, "customercontactdetails")
+    additional = base_information(stored, "customeradditionalinformation")
 
     def fields(source, mapping):
         return [getattr(E, tag)(text_of(source.get(field))) for tag, field in mapping]
@@ -362,9 +413,9 @@ def changed_since_matches(key, changed_since: str | None) -> bool:
 def generate_customerlist_response(keyword: str | None, changed_since: str | None = None) -> Response:
     """Create mock response for GET customerlist.nv -request."""
     customer_list = [
-        generate_customer_element(value["customerbaseinformation"], key)
+        generate_customer_element(base_information(value), key)
         for key, value in netvisorData.customers.items()
-        if matches_keyword(value["customerbaseinformation"], key, keyword) and changed_since_matches(key, changed_since)
+        if matches_keyword(base_information(value), key, keyword) and changed_since_matches(key, changed_since)
     ]
 
     response = E.Root(E.ResponseStatus(E.Status("OK"), E.TimeStamp(create_timestamp())), E.Customerlist(*customer_list))
@@ -380,7 +431,12 @@ def generate_response_status(status="OK"):
     return response_status
 
 
+# Characters XML 1.0 cannot carry; a query value such as id=%00 must not turn an error answer into a 500.
+_NON_XML_CHARACTERS = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
+
+
 def generate_failed_response(message, http_status=400):
+    message = _NON_XML_CHARACTERS.sub("", message)
     data = E.Root(E.ResponseStatus(E.Status("FAILED"), E.Status(message), E.TimeStamp(create_timestamp())))
     return Response(etree.tostring(data), status=http_status, content_type="text/html")
 
@@ -401,10 +457,19 @@ INVOICE_STATUS_LABELS = {
 
 
 def text_of(value, default=""):
-    """xmltodict turns an element with attributes (e.g. <salesinvoicedate format="ansi">) into a dict."""
+    """Element text from xmltodict data: an element with attributes (e.g. <salesinvoicedate format="ansi">) is a
+    dict and a repeated element is a list, whose first occurrence is used."""
+    if isinstance(value, list):
+        value = value[0] if value else None
     if isinstance(value, dict):
         value = value.get("#text")
-    return default if value is None else value
+    return default if value is None else str(value)
+
+
+def base_information(customer, section="customerbaseinformation"):
+    """A section of a stored customer (by default <customerbaseinformation>), or {} when it is missing."""
+    value = customer.get(section) if isinstance(customer, dict) else None
+    return value if isinstance(value, dict) else {}
 
 
 def find_invoicing_customer(identifier):
@@ -412,16 +477,16 @@ def find_invoicing_customer(identifier):
     key = text_of(identifier)
     if isinstance(identifier, dict) and identifier.get("@type") == "customer":
         for netvisor_key, customer in netvisorData.customers.items():
-            if customer["customerbaseinformation"].get("internalidentifier") == key:
-                return netvisor_key, customer["customerbaseinformation"]
+            if text_of(base_information(customer).get("internalidentifier")) == key:
+                return netvisor_key, base_information(customer)
         return "", {}
-    return key, netvisorData.customers.get(key, {}).get("customerbaseinformation", {})
+    return key, base_information(netvisorData.customers.get(key))
 
 
 def generate_salesinvoice(netvisor_key, pdf_image):
     """getsalesinvoice.nv <SalesInvoice> with the documented elements the mock has data for, in documented order."""
     salesinvoice = netvisorData.salesinvoices.get(netvisor_key)
-    if salesinvoice is None:
+    if not isinstance(salesinvoice, dict):
         # The Netvisor sandbox answers an unknown key with HTTP 200, Status OK and an empty <SalesInvoice />.
         return E.SalesInvoice()
 
