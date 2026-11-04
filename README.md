@@ -86,8 +86,12 @@ The resources behave as the Netvisor sandbox did on 2026-11-04:
   `INVALID_DATA :: Data form incorrect:. Employee information already exists: 010180-xxxx`
   (masked like Netvisor). An existing employee number answers HTTP 400
   `INVALID_DATA :: Data form incorrect:. Employee number already in use: <number>`.
-- The scenarios apply to `employee.nv` as to the other payroll POSTs. The request journal
-  replaces `employeeidentifier` values with `<redacted>`.
+- The scenarios apply to `employee.nv` as to the other payroll POSTs.
+
+The request journal never shows an identity code: it replaces every `employee.nv`
+`employeeidentifier`, and every `type="personalidentificationnumber"` one in `workday.nv` and
+`payrollperiodcollector.nv`, with `[redacted]`. A body that does not parse but mentions an
+employee identifier is withheld entirely.
 
 ## Requirements
 

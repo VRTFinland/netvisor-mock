@@ -321,7 +321,12 @@ def _time_post(resource):
     def accept(_org_id, _data, sequence):
         return _xml(identifier=f"mock-{sequence}" if resource == "payrollperiodcollector" else None)
 
-    return _payroll_post(_dimension_query_error, lambda: _validate_time_resource(resource), accept)
+    return _payroll_post(
+        _dimension_query_error,
+        lambda: _validate_time_resource(resource),
+        accept,
+        lambda body: _journal_body(body, only_type="personalidentificationnumber"),
+    )
 
 
 @payroll.route("/payrollperiodcollector.nv", methods=["POST"])
@@ -340,7 +345,12 @@ def workday():
 # getemployees.nv leaves ended employments out unless includeendedemployments=1.
 
 _EMPLOYEE_FIELDS = {"netvisorKey", "employeeNumber", "firstName", "lastName", "employmentStatus", "personalId"}
-_IDENTITY_CODE = re.compile(r"(<employeeidentifier\b[^>]*>)[^<]*(</employeeidentifier>)")
+_NON_XML_CHARACTERS = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
+_WITHHELD_BODY = "[withheld: an unparsable body that may carry an identity code]"
+
+
+def _is_number(text):
+    return text.isascii() and text.isdecimal()
 
 
 def _masked_identity_code(code):
@@ -348,8 +358,26 @@ def _masked_identity_code(code):
     return code[:7] + "xxxx"
 
 
-def _redact_identity_codes(body):
-    return _IDENTITY_CODE.sub(r"\1<redacted>\2", body)
+def _journal_body(body, only_type=None):
+    """The body as journaled: <employeeidentifier> values replaced by [redacted] (only those of `only_type` when
+    given). The XML is parsed, so CDATA, namespaces or odd spacing cannot hide a code; a body that does not parse
+    but mentions an employee identifier is withheld entirely."""
+    if "employeeidentifier" not in body.lower():
+        return body
+    try:
+        root = etree.fromstring(body.encode(), parser=etree.XMLParser(resolve_entities=False, no_network=True))
+    except etree.XMLSyntaxError, ValueError:
+        return _WITHHELD_BODY
+    redacted = False
+    for element in root.iter():
+        if not isinstance(element.tag, str) or etree.QName(element).localname.lower() != "employeeidentifier":
+            continue
+        if only_type is None or element.get("type") == only_type:
+            element.text = "[redacted]"
+            for child in list(element):
+                element.remove(child)
+            redacted = True
+    return etree.tostring(root, encoding="unicode") if redacted else body
 
 
 def _seeded_employee(item, index):
@@ -367,6 +395,11 @@ def _seeded_employee(item, index):
         raise ValueError(f"Invalid employee {index} netvisorKey")
     if any(not isinstance(employee[name], str) for name in ("employeeNumber", "firstName", "lastName")):
         raise ValueError(f"Invalid employee {index} names or number")
+    if employee["employeeNumber"] and not _is_number(employee["employeeNumber"]):
+        raise ValueError(f"Invalid employee {index} employeeNumber")
+    texts = [value for value in employee.values() if isinstance(value, str)]
+    if any(_NON_XML_CHARACTERS.search(value) for value in texts):
+        raise ValueError(f"Invalid employee {index}: characters XML cannot carry")
     if employee["employmentStatus"] not in {"0", "1"}:
         raise ValueError(f"Invalid employee {index} employmentStatus")
     if employee["personalId"] is not None and not isinstance(employee["personalId"], str):
@@ -454,7 +487,7 @@ def _parse_employee():
     for name in ("streetaddress", "postnumber", "city", "payrollrulegroupname"):
         _required(payroll_information, name)
     number = payroll_information.findtext("employeenumber", "").strip()
-    if number and not (number.isdigit() and len(number) <= 10):
+    if number and not (_is_number(number) and len(number) <= 10):
         raise ValueError("Invalid employeenumber")
     periods = employee.find("employmentperiods")
     if periods is None:
@@ -485,11 +518,11 @@ def _accept_employee(org_id, new, _sequence):
             return _invalid("Data form incorrect:. " + message)
         if new["employeeNumber"] and any(employee["employeeNumber"] == new["employeeNumber"] for employee in employees):
             return _invalid(f"Data form incorrect:. Employee number already in use: {new['employeeNumber']}")
-        keys = [int(employee["netvisorKey"]) for employee in employees if employee["netvisorKey"].isdigit()]
+        keys = [int(employee["netvisorKey"]) for employee in employees if _is_number(employee["netvisorKey"])]
         employees.append({**new, "netvisorKey": str(max(keys, default=0) + 1), "employmentStatus": "1"})
     return _xml()
 
 
 @payroll.route("/employee.nv", methods=["POST"])
 def add_employee():
-    return _payroll_post(_employee_query_error, _parse_employee, _accept_employee, _redact_identity_codes)
+    return _payroll_post(_employee_query_error, _parse_employee, _accept_employee, _journal_body)

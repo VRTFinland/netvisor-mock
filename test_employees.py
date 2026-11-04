@@ -178,7 +178,7 @@ class EmployeesTest(PayrollServerTestCase):
         journal = self.journal(self.org)
         self.assertEqual(journal["count"], 1)
         self.assertEqual(journal["requests"][0]["path"], "/employee.nv")
-        self.assertIn("<employeeidentifier><redacted></employeeidentifier>", journal["requests"][0]["body"])
+        self.assertIn("<employeeidentifier>[redacted]</employeeidentifier>", journal["requests"][0]["body"])
         self.assertNotIn("020290-901B", json.dumps(journal))
 
     def test_test_listing_omits_identity_codes_and_contexts_stay_isolated(self):
@@ -202,10 +202,67 @@ class EmployeesTest(PayrollServerTestCase):
             [{"netvisorKey": "1", "unknown": "x"}],
             [{"netvisorKey": "1"}, {"netvisorKey": "1"}],
             [{"netvisorKey": "1", "employeeNumber": "5"}, {"netvisorKey": "2", "employeeNumber": "5"}],
+            [{"netvisorKey": "1", "employeeNumber": "A-5"}],
+            [{"netvisorKey": "1", "firstName": "Bad\u0001name"}],
         ]:
             status, _ = self.put_json(f"/__test__/payroll/{self.org}/employees", payload, self.org)
             self.assertEqual(status, 400, payload)
         self.assertEqual(len(self.list_employees()), 2)
+
+
+class IdentityCodeJournalTest(PayrollServerTestCase):
+    """No identity code reaches GET /__test__/payroll/<org>/requests, however the body is written."""
+
+    def setUp(self):
+        self.org = "journal-" + uuid4().hex
+
+    def journaled(self, path: str, body: bytes) -> str:
+        self.call(path, "POST", body, self.org, self.auth())
+        return self.journal(self.org)["requests"][-1]["body"]
+
+    def test_employee_identity_code_in_cdata_or_with_odd_spacing_is_redacted(self):
+        for body in (
+            new_employee(identity="<![CDATA[020290-901B]]>"),
+            new_employee().replace(b"</employeeidentifier>", b"</employeeidentifier >"),
+        ):
+            self.assertNotIn("020290-901B", self.journaled("/employee.nv?method=add", body))
+
+    def test_unparsable_body_with_an_employee_identifier_is_withheld(self):
+        body = self.journaled("/employee.nv?method=add", b"<root><employee><employeeidentifier>020290-901B")
+
+        self.assertNotIn("020290-901B", body)
+        self.assertIn("withheld", body)
+
+    def test_workday_personal_identification_number_is_redacted_but_other_types_are_kept(self):
+        workday = b"""<root><workday><date format="ansi" method="replace">2026-10-09</date>
+            <employeeidentifier type="{type}">{value}</employeeidentifier>
+            <workdayhour><hours>7.5</hours><collectorratio type="number">4567</collectorratio>
+            <acceptancestatus>accepted</acceptancestatus><description>Port work</description></workdayhour>
+        </workday></root>"""
+
+        pin = self.journaled(
+            "/workday.nv?useonlyexistingdimensions=1",
+            workday.replace(b"{type}", b"personalidentificationnumber").replace(b"{value}", b"010180-900A"),
+        )
+        number_body = workday.replace(b"{type}", b"number").replace(b"{value}", b"EMP-2")
+        number = self.journaled("/workday.nv?useonlyexistingdimensions=1", number_body)
+
+        self.assertNotIn("010180-900A", pin)
+        self.assertIn("[redacted]", pin)
+        self.assertEqual(number, number_body.decode())
+
+
+class EmployeeKeyTest(PayrollServerTestCase):
+    def test_non_ascii_digit_keys_do_not_break_the_next_key(self):
+        org = "keys-" + uuid4().hex
+        self.put_json(f"/__test__/payroll/{org}/employees", [{"netvisorKey": "²"}, {"netvisorKey": "7"}], org)
+
+        status, _ = self.call("/employee.nv?method=add", "POST", new_employee(), org, self.auth())
+
+        self.assertEqual(status, 200)
+        _, body = self.call("/getemployees.nv", org=org, headers=self.auth())
+        keys = [e.findtext("netvisorkey") for e in etree.fromstring(body).findall("employees/employee")]
+        self.assertEqual(keys, ["²", "7", "8"])
 
 
 if __name__ == "__main__":
