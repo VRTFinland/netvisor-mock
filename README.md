@@ -33,9 +33,7 @@ controls do not affect invoice data or other organisations.
 
 ## Requirements
 
-* Python > 3.6 
-* pipenv
-* libxslt & libxml (for lxml).
+* [uv](https://docs.astral.sh/uv/) (installs Python 3.15 automatically if needed)
 
 Or
 
@@ -44,7 +42,22 @@ Or
 ## Install & run
 
 ```
-$ pipenv install
-$ FLASK_APP=app.py pipenv run flask run -p 5001
+$ uv sync
+$ uv run flask run -p 5001
 ```
 
+## Development
+
+```
+$ uv run ruff check        # lint
+$ uv run ruff format       # format
+$ uv run ty check          # type check
+$ uv run python -m unittest
+```
+
+## Docker
+
+```
+$ docker build -t netvisor-mock .
+$ docker run -p 5001:5001 netvisor-mock
+```

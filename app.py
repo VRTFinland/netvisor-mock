@@ -1,13 +1,13 @@
 import base64
 import json
 import os
-
-import xmltodict
-from lxml import etree
-from lxml.builder import E
 from datetime import datetime
 
-from flask import Flask, request, Response
+import xmltodict
+from flask import Flask, Response, request
+from lxml import etree
+from lxml.builder import E
+
 from payroll_mock import payroll
 
 app = Flask(__name__)
@@ -15,7 +15,6 @@ app.register_blueprint(payroll)
 
 
 class NetvisorData:
-
     def __init__(self):
         data = self.read_data_json()
         self.customers = data.get("customers", {})
@@ -28,7 +27,7 @@ class NetvisorData:
         """Create data.json -file if it doesn't exist."""
 
         if os.path.isfile("data.json"):
-            with open('data.json', 'r') as fh:
+            with open("data.json") as fh:
                 data = json.loads(fh.read())
                 return data
         else:
@@ -41,29 +40,29 @@ class NetvisorData:
         self.salesinvoice_count = 0
         self.customer_count = 0
 
-        with open('data.json', 'w') as fh:
+        with open("data.json", "w") as fh:
             data = {
                 "customers": self.customers,
                 "salesinvoices": self.salesinvoices,
                 "customersCount": self.customer_count,
                 "salesinvoicesCount": self.salesinvoice_count,
-                "businessIdCustomerMap": self.businessIdCustomerMap
+                "businessIdCustomerMap": self.businessIdCustomerMap,
             }
             fh.write(json.dumps(data, indent=4))
             return data
 
     def write_data(self):
-        with open('data.json', 'w') as fh:
+        with open("data.json", "w") as fh:
             data = {
                 "customers": self.customers,
                 "salesinvoices": self.salesinvoices,
                 "customersCount": self.customer_count,
                 "salesinvoicesCount": self.salesinvoice_count,
-                "businessIdCustomerMap": self.businessIdCustomerMap
+                "businessIdCustomerMap": self.businessIdCustomerMap,
             }
             fh.write(json.dumps(data, indent=4))
 
-    def add_customer(self, payload, customer_id=None):
+    def add_customer(self, payload):
         self.customer_count += 1
         customer_id = str(self.customer_count)
         self.customers[customer_id] = payload.get("root").get("customer")
@@ -139,9 +138,8 @@ def post_salesinvoice():
         return Response(None, status=204)
 
 
-def update_salesinvoice_status(netvisor_key, status):
-    salesinvoice = netvisorData.salesinvoices.get(netvisor_key)
-    salesinvoice.get("salesinvoicestatus", {})["#text"] = status
+# Documented values for updatesalesinvoicestatus.nv; the Netvisor sandbox rejects e.g. "unsent".
+SALESINVOICE_STATUSES = {"open", "overdue", "reminded", "requested", "collected", "paid", "creditloss"}
 
 
 @app.route("/updatesalesinvoicestatus.nv", methods=["POST"])
@@ -149,119 +147,150 @@ def post_salesinvoicestatus():
     netvisor_key = request.args.get("netvisorkey")
     status = request.args.get("status")
 
-    update_salesinvoice_status(netvisor_key, status)
+    # Same order, texts and HTTP status as the Netvisor sandbox (2026-11-05, UseHTTPResponseStatusCodes=1).
+    if status not in SALESINVOICE_STATUSES:
+        return generate_failed_response("INVALID_DATA :: Data form incorrect:. Invalid invoice status")
+    salesinvoice = netvisorData.salesinvoices.get(netvisor_key)
+    if salesinvoice is None:
+        return generate_failed_response(
+            f"INVALID_DATA :: Data form incorrect:. No invoice found for the given ID, ID: {netvisor_key}"
+        )
+
+    salesinvoice.get("salesinvoicestatus", {})["#text"] = status
+    netvisorData.write_data()
     return generate_inserted_data_response(netvisor_key)
 
 
 def generate_customer_element(customer, key):
+    """One customerlist.nv <Customer>; Code is the customer code imported as <internalidentifier>."""
     return E.Customer(
         E.Netvisorkey(key),
-        E.Name(customer.get("name", "")),
-        E.Code(customer.get("code", "")),
-        E.OrganisationIdentifier(customer.get("externalidentifier", "")),
-        E.Uri(f"{BASE_URL}/getcustomer.nv?id={key}")
+        E.Name(text_of(customer.get("name"))),
+        E.Code(text_of(customer.get("internalidentifier"))),
+        E.OrganisationIdentifier(text_of(customer.get("externalidentifier"))),
+        E.CustomerGroupID(""),
+        E.CustomerGroupName(text_of(customer.get("customergroupname"))),
+        E.Uri(f"{BASE_URL}/getcustomer.nv?id={key}"),
     )
 
 
-def generate_customerlist_response(keyword: str) -> str:
-    """
-    Create mock response for GET customerlist.nv -request.
+# customerlist.nv searches name, customer code, business ID and name extension for "keyword*".
+CUSTOMERLIST_KEYWORD_FIELDS = ("name", "internalidentifier", "externalidentifier", "nameextension")
 
-    :rtype string:
-    :return: XML-response as string.
-    """
-    customer_list = []
 
-    for key, value in netvisorData.customers.items():
-        if not keyword:
-            customer_list.append(
-                generate_customer_element(value.get("customerbaseinformation"), key)
-            )
-        else:
-            if value.get("customerbaseinformation").get("externalidentifier").startswith(keyword):
-                customer_list.append(
-                    generate_customer_element(value.get("customerbaseinformation"), key)
-                )
+def matches_keyword(customer, keyword: str | None) -> bool:
+    if not keyword:
+        return True
+    return any(text_of(customer.get(field)).startswith(keyword) for field in CUSTOMERLIST_KEYWORD_FIELDS)
 
-    response = E.Root(
-        E.ResponseStatus(
-            E.Status("OK"),
-            E.TimeStamp(create_timestamp())
-        ),
-        E.Customerlist()
-    )
-    response.find("Customerlist").extend(customer_list)
-    xml_response = etree.tostring(response, pretty_print=True)
-    print(xml_response)
 
-    return Response(xml_response, content_type="text/html")
+def generate_customerlist_response(keyword: str | None) -> Response:
+    """Create mock response for GET customerlist.nv -request."""
+    customer_list = [
+        generate_customer_element(value["customerbaseinformation"], key)
+        for key, value in netvisorData.customers.items()
+        if matches_keyword(value["customerbaseinformation"], keyword)
+    ]
+
+    response = E.Root(E.ResponseStatus(E.Status("OK"), E.TimeStamp(create_timestamp())), E.Customerlist(*customer_list))
+    return Response(etree.tostring(response, pretty_print=True), content_type="text/html")
 
 
 def create_timestamp():
     return datetime.now().strftime("%d.%m.%Y %H:%M:%S")
 
 
-def create_date():
-    return datetime.now().strftime("%Y-%m-%d")
-
-
 def generate_response_status(status="OK"):
-    response_status = E.ResponseStatus(
-        E.Status(status),
-        E.TimeStamp(create_timestamp())
-    )
+    response_status = E.ResponseStatus(E.Status(status), E.TimeStamp(create_timestamp()))
     return response_status
 
 
-def create_ansi_date(element_name, value=create_date()):
-    element = etree.SubElement(element_name, value)
-    element.set("format", "ansi")
-    element.text = value
-    return element
+def generate_failed_response(message, http_status=400):
+    data = E.Root(E.ResponseStatus(E.Status("FAILED"), E.Status(message), E.TimeStamp(create_timestamp())))
+    return Response(etree.tostring(data), status=http_status, content_type="text/html")
 
 
-def get_salesinvoice_amount(salesinvoice):
-    return "12345"
+# English labels for <InvoiceStatus status="...">: the documented example is Finnish ("Maksettu") and GISGRO
+# requests X-Netvisor-Interface-Language EN, so these texts are an assumption; the status codes are documented.
+INVOICE_STATUS_LABELS = {
+    "open": "Open",
+    "unsent": "Unsent",
+    "paid": "Paid",
+    "overdue": "Overdue",
+    "reminded": "Reminded",
+    "requested": "Requested",
+    "collected": "Collected",
+    "creditloss": "Credit loss",
+    "rejected": "Rejected",
+}
+
+
+def text_of(value, default=""):
+    """xmltodict turns an element with attributes (e.g. <salesinvoicedate format="ansi">) into a dict."""
+    if isinstance(value, dict):
+        value = value.get("#text")
+    return default if value is None else value
+
+
+def find_invoicing_customer(identifier):
+    """Resolve <invoicingcustomeridentifier type="netvisor|customer">; returns (netvisor key, base information)."""
+    key = text_of(identifier)
+    if isinstance(identifier, dict) and identifier.get("@type") == "customer":
+        for netvisor_key, customer in netvisorData.customers.items():
+            if customer["customerbaseinformation"].get("internalidentifier") == key:
+                return netvisor_key, customer["customerbaseinformation"]
+        return "", {}
+    return key, netvisorData.customers.get(key, {}).get("customerbaseinformation", {})
 
 
 def generate_salesinvoice(netvisor_key, pdf_image):
+    """getsalesinvoice.nv <SalesInvoice> with the documented elements the mock has data for, in documented order."""
     salesinvoice = netvisorData.salesinvoices.get(netvisor_key)
-    get = salesinvoice.get
-    customer_id = salesinvoice.get("invoicingcustomeridentifier").get("#text")
-    customer = netvisorData.customers.get(customer_id).get("customerbaseinformation")
+    if salesinvoice is None:
+        # The Netvisor sandbox answers an unknown key with HTTP 200, Status OK and an empty <SalesInvoice />.
+        return E.SalesInvoice()
 
-    invoice_data = (
-        E.SalesInvoice(
-            E.SalesInvoiceNetvisorKey(netvisor_key),
-            E.SalesInvoiceNumber("5000001"),
-            E.SalesInvoiceDate(get("salesinvoicedate", "")),
-            E.SalesInvoiceValueDate(get("salesinvoicevaluedate", "")),
-            E.SalesInvoiceDeliveryDate(get("salesinvoicedate", "")),
-            E.SalesInvoiceDueDate(get("salesinvoiceduedate", "")),
-            E.SalesInvoiceReferenceNumber(get("salesinvoicereferencenumber", "")),
-            E.SalesInvoiceAmount(get_salesinvoice_amount(salesinvoice)),
-            E.SellerIdentifier(get("selleridentifier", ""), type="name"),
-            E.InvoiceStatus(get("invoicestatus", "OPEN")),
-            E.SalesInvoiceFreeTextBeforeLines(""),
-            E.SalesInvoiceFreeTextAfterLines(""),
-            E.SalesInvoiceOurReference(get("salesinvoiceourreference", "")),
-            E.SalesInvoiceYourReference(get("salesinvoiceyourreference", "")),
-            E.SalesInvoicePrivateComment(""),
-            E.SalesInvoiceAgreementIdentifier(""),
-            E.InvoicingCustomerName(customer.get("name", "")),
-            E.InvoicingCustomerNameExtension(customer.get("invoicingcustomernameextension", "")),
-            E.InvoicingCustomerNetvisorKey(customer_id),
-            E.InvoicingCustomerOrganisationIdentifier(customer.get("externalidentifier", "")),
-            E.InvoicingCustomerAddressLine(customer.get("streetaddress", "")),
-            E.InvoicingCustomerAdditionalAddressLine(customer.get("additionaladdressline", "")),
-            E.InvoicingCustomerPostnumber(customer.get("postnumber", "")),
-            E.InvoicingCustomerTown(customer.get("city", "")),
-            E.InvoicingCustomerCountryCode("FINLAND"),
-            E.MatchPartialPaymentsByDefault("No"),
-        )
+    def get(field, default=""):
+        return text_of(salesinvoice.get(field), default)
+
+    customer_key, customer = find_invoicing_customer(salesinvoice.get("invoicingcustomeridentifier"))
+    invoice_date = get("salesinvoicedate")
+    status = get("salesinvoicestatus", "open")
+    country = get("invoicingcustomercountrycode") or text_of(customer.get("country"), "FI")
+
+    invoice_data = E.SalesInvoice(
+        E.SalesInvoiceNetvisorKey(netvisor_key),
+        E.SalesInvoiceNumber(get("salesinvoicenumber") or "5000001"),
+        E.SalesInvoiceDate(invoice_date, format="ansi"),
+        E.SalesInvoiceValueDate(get("salesinvoicevaluedate") or invoice_date, format="ansi"),
+        E.SalesInvoiceDeliveryDate(get("salesinvoicedeliverydate") or invoice_date, format="ansi"),
+        E.SalesInvoiceDueDate(get("salesinvoiceduedate"), format="ansi"),
+        E.SalesInvoiceReferencenumber(get("salesinvoicereferencenumber")),
+        E.SalesInvoiceAmount(get("salesinvoiceamount")),
+        E.SellerIdentifier(get("selleridentifier"), type="name"),
+        E.InvoiceStatus(INVOICE_STATUS_LABELS.get(status, status), status=status),
+        E.SalesInvoiceFreeTextBeforeLines(get("salesinvoicefreetextbeforelines")),
+        E.SalesInvoiceFreeTextAfterLines(get("salesinvoicefreetextafterlines")),
+        E.SalesInvoiceOurReference(get("salesinvoiceourreference")),
+        E.SalesInvoiceYourReference(get("salesinvoiceyourreference")),
+        E.SalesInvoicePrivateComment(get("salesinvoiceprivatecomment")),
+        E.SalesInvoiceAgreementIdentifier(get("salesinvoiceagreementidentifier")),
+        E.InvoicingCustomerCode(text_of(customer.get("internalidentifier"))),
+        E.InvoicingCustomerName(text_of(customer.get("name"))),
+        E.InvoicingCustomerNameExtension(text_of(customer.get("nameextension"))),
+        E.InvoicingCustomerNetvisorKey(customer_key),
+        E.InvoicingCustomerOrganizationIdentifier(text_of(customer.get("externalidentifier"))),
+        E.InvoicingCustomerAddressline(text_of(customer.get("streetaddress"))),
+        E.InvoicingCustomerAdditionalAddressLine(text_of(customer.get("additionaladdressline"))),
+        E.InvoicingCustomerPostnumber(text_of(customer.get("postnumber"))),
+        E.InvoicingCustomerTown(text_of(customer.get("city"))),
+        E.InvoicingCustomerCountryCode(country, type="ISO-3166"),
+        E.MatchPartialPaymentsByDefault("No"),
     )
 
-    if pdf_image:
+    # pdfimage: pdf = always, nopdf = never, lastsentprintservice (default) = only if sent to the print
+    # service, which never happens in the mock.
+    if pdf_image == "pdf":
         invoice_data.append(E.LastSentInvoicePDFBase64Data(generate_invoice_pdf()))
 
     return invoice_data
@@ -277,22 +306,17 @@ def generate_get_salesinvoice_response(netvisor_key, pdf_image):
 
 def generate_invoice_pdf():
     with open("invoice.pdf", "rb") as invoice_pdf:
-        return base64.b64encode(invoice_pdf.read()).decode('utf-8')
+        return base64.b64encode(invoice_pdf.read()).decode("utf-8")
 
 
 def generate_inserted_data_response(identifier):
     data = E.Root(
-        E.ResponseStatus(
-            E.Status("OK"),
-            E.TimeStamp(create_timestamp())
-        ),
-        E.Replies(
-            E.InsertedDataIdentifier(identifier)
-        )
+        E.ResponseStatus(E.Status("OK"), E.TimeStamp(create_timestamp())),
+        E.Replies(E.InsertedDataIdentifier(identifier)),
     )
 
     return Response(etree.tostring(data), content_type="text/html")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.run()

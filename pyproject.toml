@@ -1,0 +1,31 @@
+[project]
+name = "netvisor-mock"
+version = "0.1.0"
+description = "Dummy and limited implementation of the Netvisor API for testing purposes"
+readme = "README.md"
+requires-python = ">=3.15"
+dependencies = [
+    "flask>=3",
+    "lxml>=6",
+    "xmltodict>=1",
+]
+
+[dependency-groups]
+dev = [
+    "ruff",
+    "ty",
+    "types-lxml>=2026.2.16",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+target-version = "py315"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "C4", "RUF"]
+
+[tool.ty.environment]
+python-version = "3.15"
