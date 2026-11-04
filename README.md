@@ -4,6 +4,7 @@ This is dummy and limited implementation of Netvisor API for testing purposes.
 Functionality is limited to following endpoints:
 - [POST] /customer.nv
 - [GET] /customerlist.nv
+- [GET] /getcustomer.nv?id=<key> or ?idlist=<key>,<key>
 - [GET] /getsalesinvoice.nv
 - [POST] /salesinvoice.nv
 - [POST] /updatesalesinvoicestatus.nv
@@ -13,6 +14,25 @@ Functionality is limited to following endpoints:
 
 Additionally mock API supports `[POST] /reset` -endpoint to clear stored
 data.
+
+### Invoicing behaviour
+
+The responses follow the Netvisor sandbox (2026-11-05, with
+`X-Netvisor-Authentication-UseHTTPResponseStatusCodes: 1`) and the Netvisor API documentation.
+Errors answer HTTP 400 with `<Status>FAILED</Status>` and a second `<Status>` such as
+`INVALID_DATA :: Data form incorrect:. Customer not found with Netvisor identifier: 9`.
+
+- `customer.nv` requires `method=add|edit`; `edit` requires the `id` of a stored customer.
+- `customerlist.nv?keyword=` matches a case-insensitive substring of the name, customer code,
+  business ID or name extension. `changedsince=` (`YYYY-MM-DD` or `YYYY-MM-DDThh:mm:ss`,
+  Europe/Helsinki) lists customers added or edited at or after that time and is ignored with
+  a keyword. A customer without an imported `internalidentifier` shows its key as `Code`.
+- `getcustomer.nv` returns a bare `<Customer>` for one match and `<Customers>` for several;
+  unknown keys in `idlist` are skipped, and no match at all is an error.
+- `getsalesinvoice.nv` returns an empty `<SalesInvoice />` with Status OK for an unknown key.
+  The PDF is included only with `pdfimage=pdf`.
+- `updatesalesinvoicestatus.nv` accepts `open`, `overdue`, `reminded`, `requested`,
+  `collected`, `paid` and `creditloss`, and rejects an unknown invoice.
 
 Payroll requests require Netvisor authentication headers signed with the received URL.
 The default mock partner ID/key are `gisgro-test-partner`/`gisgro-test-partner-key`,

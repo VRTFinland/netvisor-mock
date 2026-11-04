@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 
 from lxml import etree
 
-from app import BASE_URL, app, netvisorData
+from app import BASE_URL, NetvisorData, app, netvisorData
 
 CUSTOMER_PORT = b"""<root><customer><customerbaseinformation>
     <internalidentifier>C-1</internalidentifier>
@@ -70,15 +70,13 @@ class AppTestCase(unittest.TestCase):
             "businessIdCustomerMap": {},
             "customer_count": 0,
             "salesinvoice_count": 0,
+            "customer_changed": {},
             "write_data": self.write_data,
         }
         for name, value in state.items():
             patcher = patch.object(netvisorData, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
-        print_patcher = patch("builtins.print")
-        print_patcher.start()
-        self.addCleanup(print_patcher.stop)
 
     def add_customer(self, xml: bytes = CUSTOMER_PORT) -> str | None:
         response = self.client.post("/customer.nv?method=add", data=xml)
@@ -102,7 +100,12 @@ class RootAndResetTest(AppTestCase):
         self.add_customer()
         self.add_salesinvoice()
 
-        with tempfile.TemporaryDirectory() as tmp, contextlib.chdir(tmp):
+        real_write = NetvisorData.write_data.__get__(netvisorData)
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            contextlib.chdir(tmp),
+            patch.object(netvisorData, "write_data", real_write),
+        ):
             response = self.client.post("/reset")
             stored = json.loads(Path("data.json").read_text())
 
@@ -115,6 +118,7 @@ class RootAndResetTest(AppTestCase):
                 "customersCount": 0,
                 "salesinvoicesCount": 0,
                 "businessIdCustomerMap": {},
+                "customerChangedTimes": {},
             },
         )
         self.assertEqual(netvisorData.customers, {})
@@ -177,13 +181,21 @@ class CustomerListTest(AppTestCase):
                 ("Name", "Port Oy"),
                 ("Code", "C-1"),
                 ("OrganisationIdentifier", "1234567-8"),
-                ("CustomerGroupID", None),
+                ("CustomerGroupID", "1"),
                 ("CustomerGroupName", "Ports"),
                 ("Uri", f"{BASE_URL}/getcustomer.nv?id=1"),
             ],
         )
 
-    def test_keyword_matches_prefix_of_name_code_business_id_or_name_extension(self):
+    def test_customer_without_code_or_group_shows_key_and_default_group(self):
+        self.add_customer(CUSTOMER_SHIP.replace(b"<internalidentifier>C-2</internalidentifier>", b""))
+
+        customer = self.customers()[0]
+
+        self.assertEqual(customer.findtext("Code"), "1")
+        self.assertEqual(customer.findtext("CustomerGroupName"), "Asiakasryhmä 1")
+
+    def test_keyword_matches_case_insensitive_substring_of_name_code_business_id_or_name_extension(self):
         self.add_customer(CUSTOMER_PORT)
         self.add_customer(CUSTOMER_SHIP)
 
@@ -191,11 +203,166 @@ class CustomerListTest(AppTestCase):
             return [c.findtext("Netvisorkey") for c in self.customers(f"?keyword={keyword}")]
 
         self.assertEqual(keys("1234"), ["1"])
-        self.assertEqual(keys("Ship"), ["2"])
-        self.assertEqual(keys("C-"), ["1", "2"])
-        self.assertEqual(keys("Harb"), ["1"])
-        self.assertEqual(keys("4567"), [])
-        self.assertEqual(keys("Oy"), [])
+        self.assertEqual(keys("4567"), ["1"])
+        self.assertEqual(keys("ship"), ["2"])
+        self.assertEqual(keys("oy"), ["1"])
+        self.assertEqual(keys("c-"), ["1", "2"])
+        self.assertEqual(keys("rbou"), ["1"])
+        self.assertEqual(keys("Kotka"), [])
+
+    def test_changedsince_lists_customers_changed_at_or_after_the_given_local_time(self):
+        self.add_customer(CUSTOMER_PORT)
+        self.add_customer(CUSTOMER_SHIP)
+        netvisorData.customer_changed.update({"1": "2026-11-01T08:00:00", "2": "2026-11-05T12:30:00"})
+
+        def keys(query: str) -> list[str | None]:
+            return [c.findtext("Netvisorkey") for c in self.customers(query)]
+
+        self.assertEqual(keys("?changedsince=2026-11-05T12:30:00"), ["2"])
+        self.assertEqual(keys("?changedsince=2026-11-05T12:30:01"), [])
+        self.assertEqual(keys("?changedsince=2026-11-01"), ["1", "2"])
+        self.assertEqual(keys("?changedsince=2026-11-02 00:00:00"), ["2"])
+        self.assertEqual(keys("?keyword=Port&changedsince=2030-01-01"), ["1"])
+
+    def test_customer_without_change_time_is_always_listed(self):
+        self.add_customer(CUSTOMER_PORT)
+        netvisorData.customer_changed.clear()
+
+        self.assertEqual(len(self.customers("?changedsince=2030-01-01")), 1)
+
+    def test_add_and_edit_record_the_change_time(self):
+        self.add_customer(CUSTOMER_PORT)
+        added = netvisorData.customer_changed["1"]
+        netvisorData.customer_changed["1"] = "2000-01-01T00:00:00"
+
+        self.client.post("/customer.nv?method=edit&id=1", data=CUSTOMER_SHIP)
+
+        self.assertRegex(added, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
+        self.assertGreater(netvisorData.customer_changed["1"], "2000-01-01T00:00:00")
+
+    def test_invalid_changedsince_is_rejected(self):
+        response = self.client.get("/customerlist.nv?changedsince=bogus")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            statuses(response.data),
+            ["FAILED", "INVALID_DATA :: Data form incorrect:. Date is invalid: bogus Enter date in format: YYYY-MM-DD"],
+        )
+
+
+class CustomerErrorsTest(AppTestCase):
+    """Pinned to what the Netvisor sandbox returned on 2026-11-05."""
+
+    def assert_rejected(self, query: str, message: str):
+        response = self.client.post("/customer.nv" + query, data=CUSTOMER_PORT)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(statuses(response.data), ["FAILED", "INVALID_DATA :: Data form incorrect:. " + message])
+        self.assertEqual(netvisorData.customers, {})
+        self.write_data.assert_not_called()
+
+    def test_edit_of_unknown_customer(self):
+        self.assert_rejected("?method=edit&id=999999999", "Cannot be updated. Customer not found, ID: 999999999")
+
+    def test_edit_without_id(self):
+        self.assert_rejected("?method=edit", "Parameter not valid: id missing")
+
+    def test_unknown_method(self):
+        self.assert_rejected("?method=bogus", "Parameter not valid: method: bogus. Allowed values: add, edit")
+
+    def test_missing_method(self):
+        self.assert_rejected("", "Parameter not valid: method missing")
+
+
+class GetCustomerTest(AppTestCase):
+    def get(self, query: str):
+        return self.client.get("/getcustomer.nv" + query)
+
+    def test_single_customer_is_a_bare_customer_element(self):
+        self.add_customer(CUSTOMER_PORT)
+
+        for query in ("?id=1", "?idlist=1"):
+            response = self.get(query)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(statuses(response.data), ["OK"])
+            root = parse(response.data)
+            self.assertIsNone(root.find("Customers"), query)
+            self.assertEqual(root.findtext("Customer/CustomerBaseInformation/NetvisorKey"), "1", query)
+
+    def test_customer_details_follow_the_sandbox_structure(self):
+        self.add_customer(CUSTOMER_PORT)
+
+        customer = parse(self.get("?id=1").data).find("Customer")
+
+        assert customer is not None
+        self.assertEqual(
+            [section.tag for section in customer],
+            [
+                "CustomerBaseInformation",
+                "CustomerFinvoiceDetails",
+                "CustomerDeliveryDetails",
+                "CustomerContactDetails",
+                "CustomerContactPersons",
+                "CustomerAdditionalInformation",
+            ],
+        )
+        base_information = customer.find("CustomerBaseInformation")
+        assert base_information is not None
+        base = {child.tag: child.text for child in base_information}
+        self.assertEqual(
+            base,
+            {
+                "NetvisorKey": "1",
+                "InternalIdentifier": "C-1",
+                "ExternalIdentifier": "1234567-8",
+                "OrganizationUnitNumber": None,
+                "CustomerGroupNetvisorKey": "1",
+                "CustomerGroupName": "Ports",
+                "Name": "Port Oy",
+                "NameExtension": "Harbour",
+                "StreetAddress": "Satamatie 1",
+                "AdditionalStreetAddress": None,
+                "City": "Kotka",
+                "PostNumber": "48100",
+                "Country": "FI",
+                "PhoneNumber": None,
+                "FaxNumber": None,
+                "Email": None,
+                "EmailInvoicingAddress": None,
+                "HomePageUri": None,
+                "IsActive": "1",
+                "IsPrivateCustomer": "0",
+            },
+        )
+        self.assertEqual(customer.xpath("string(CustomerBaseInformation/Country/@type)"), "ISO-3166")
+        self.assertEqual(customer.findtext("CustomerAdditionalInformation/InvoicingLanguage"), "FI")
+
+    def test_several_customers_are_wrapped_and_unknown_keys_skipped(self):
+        self.add_customer(CUSTOMER_PORT)
+        self.add_customer(CUSTOMER_SHIP)
+
+        root = parse(self.get("?idlist=2,1,999999999").data)
+
+        self.assertEqual(
+            [key.text for key in root.iterfind("Customers/Customer/CustomerBaseInformation/NetvisorKey")], ["2", "1"]
+        )
+        self.assertEqual(root.findtext("Customer/CustomerBaseInformation/NetvisorKey"), None)
+        one = parse(self.get("?idlist=1,999999999").data)
+        self.assertEqual(one.findtext("Customer/CustomerBaseInformation/NetvisorKey"), "1")
+
+    def test_no_known_customer_is_rejected_with_the_requested_identifiers(self):
+        for query, requested in [
+            ("?id=999999999", "999999999"),
+            ("?idlist=999999998,999999999", "999999998,999999999"),
+        ]:
+            response = self.get(query)
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(
+                statuses(response.data),
+                [
+                    "FAILED",
+                    f"INVALID_DATA :: Data form incorrect:. Customer not found with Netvisor identifier: {requested}",
+                ],
+            )
 
 
 class SalesInvoiceTest(AppTestCase):

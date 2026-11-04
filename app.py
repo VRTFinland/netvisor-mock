@@ -1,7 +1,8 @@
 import base64
 import json
 import os
-from datetime import datetime
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import xmltodict
 from flask import Flask, Response, request
@@ -14,6 +15,14 @@ app = Flask(__name__)
 app.register_blueprint(payroll)
 
 
+# Netvisor's local time; GISGRO sends changedsince in Europe/Helsinki.
+NETVISOR_TIMEZONE = ZoneInfo("Europe/Helsinki")
+
+
+def netvisor_now() -> str:
+    return datetime.now(NETVISOR_TIMEZONE).strftime("%Y-%m-%dT%H:%M:%S")
+
+
 class NetvisorData:
     def __init__(self):
         data = self.read_data_json()
@@ -22,45 +31,39 @@ class NetvisorData:
         self.customer_count = data.get("customersCount", 0)
         self.salesinvoice_count = data.get("salesinvoicesCount", 0)
         self.businessIdCustomerMap = data.get("businessIdCustomerMap", {})
+        # Netvisor-local change time per customer key; customers stored before it existed have none.
+        self.customer_changed = data.get("customerChangedTimes", {})
 
     def read_data_json(self):
         """Create data.json -file if it doesn't exist."""
-
         if os.path.isfile("data.json"):
             with open("data.json") as fh:
-                data = json.loads(fh.read())
-                return data
-        else:
-            return self.reset_data()
+                return json.loads(fh.read())
+        return self.reset_data()
+
+    def snapshot(self):
+        return {
+            "customers": self.customers,
+            "salesinvoices": self.salesinvoices,
+            "customersCount": self.customer_count,
+            "salesinvoicesCount": self.salesinvoice_count,
+            "businessIdCustomerMap": self.businessIdCustomerMap,
+            "customerChangedTimes": self.customer_changed,
+        }
 
     def reset_data(self):
         self.customers = {}
         self.salesinvoices = {}
         self.businessIdCustomerMap = {}
+        self.customer_changed = {}
         self.salesinvoice_count = 0
         self.customer_count = 0
-
-        with open("data.json", "w") as fh:
-            data = {
-                "customers": self.customers,
-                "salesinvoices": self.salesinvoices,
-                "customersCount": self.customer_count,
-                "salesinvoicesCount": self.salesinvoice_count,
-                "businessIdCustomerMap": self.businessIdCustomerMap,
-            }
-            fh.write(json.dumps(data, indent=4))
-            return data
+        self.write_data()
+        return self.snapshot()
 
     def write_data(self):
         with open("data.json", "w") as fh:
-            data = {
-                "customers": self.customers,
-                "salesinvoices": self.salesinvoices,
-                "customersCount": self.customer_count,
-                "salesinvoicesCount": self.salesinvoice_count,
-                "businessIdCustomerMap": self.businessIdCustomerMap,
-            }
-            fh.write(json.dumps(data, indent=4))
+            fh.write(json.dumps(self.snapshot(), indent=4))
 
     def add_customer(self, payload):
         self.customer_count += 1
@@ -68,11 +71,13 @@ class NetvisorData:
         self.customers[customer_id] = payload.get("root").get("customer")
         business_id = payload.get("root").get("customer").get("customerbaseinformation").get("externalidentifier")
         self.businessIdCustomerMap[business_id] = customer_id
+        self.customer_changed[customer_id] = netvisor_now()
         self.write_data()
         return customer_id
 
     def edit_customer(self, customer_id, payload):
         self.customers[customer_id] = payload.get("root").get("customer")
+        self.customer_changed[customer_id] = netvisor_now()
         self.write_data()
         return customer_id
 
@@ -102,22 +107,73 @@ def root():
 @app.route("/customerlist.nv", methods=["GET"])
 def get_customer_list():
     keyword = request.args.get("keyword")
-    return generate_customerlist_response(keyword)
+    changed_since = None
+    # Netvisor ignores changedsince when a keyword is given.
+    if not keyword and request.args.get("changedsince"):
+        changed_since = parse_changed_since(request.args["changedsince"])
+        if changed_since is None:
+            return generate_failed_response(
+                "INVALID_DATA :: Data form incorrect:. "
+                f"Date is invalid: {request.args['changedsince']} Enter date in format: YYYY-MM-DD"
+            )
+    return generate_customerlist_response(keyword, changed_since)
+
+
+def parse_changed_since(value: str) -> str | None:
+    """Netvisor-local "YYYY-MM-DDThh:mm:ss" for the accepted changedsince forms, or None when invalid."""
+    for pattern in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(value, pattern).strftime("%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            pass
+    try:
+        return date.fromisoformat(value).strftime("%Y-%m-%dT00:00:00")
+    except ValueError:
+        return None
 
 
 @app.route("/customer.nv", methods=["POST"])
 def create_customer():
-    payload = xmltodict.parse(request.data)
+    # Texts as the Netvisor sandbox answered on 2026-11-05; "method missing" follows the "id missing" wording.
+    method = request.args.get("method")
+    if not method:
+        return generate_failed_response("INVALID_DATA :: Data form incorrect:. Parameter not valid: method missing")
+    if method not in {"add", "edit"}:
+        return generate_failed_response(
+            f"INVALID_DATA :: Data form incorrect:. Parameter not valid: method: {method}. Allowed values: add, edit"
+        )
+    customer_id = request.args.get("id")
+    if method == "edit" and not customer_id:
+        return generate_failed_response("INVALID_DATA :: Data form incorrect:. Parameter not valid: id missing")
+    if method == "edit" and customer_id not in netvisorData.customers:
+        return generate_failed_response(
+            f"INVALID_DATA :: Data form incorrect:. Cannot be updated. Customer not found, ID: {customer_id}"
+        )
 
-    if request.args.get("method") == "add":
-        print("Adding customer")
+    payload = xmltodict.parse(request.data)
+    if method == "add":
         customer_id = netvisorData.add_customer(payload)
-        return generate_inserted_data_response(customer_id)
     else:
-        print("Edit customer")
-        customer_id = request.args.get("id")
         netvisorData.edit_customer(customer_id, payload)
-        return generate_inserted_data_response(customer_id)
+    return generate_inserted_data_response(customer_id)
+
+
+@app.route("/getcustomer.nv", methods=["GET"])
+def get_customer():
+    requested = request.args.get("idlist") or request.args.get("id")
+    if not requested:
+        return generate_failed_response("INVALID_DATA :: Data form incorrect:. Parameter not valid: id missing")
+    keys = list(dict.fromkeys(key.strip() for key in requested.split(",")))
+    found = [key for key in keys if key in netvisorData.customers]
+    # Sandbox 2026-11-05: unknown keys are skipped; none found is 400, one is a bare <Customer>, more are wrapped.
+    if not found:
+        return generate_failed_response(
+            f"INVALID_DATA :: Data form incorrect:. Customer not found with Netvisor identifier: {requested}"
+        )
+    customers = [generate_customer_details(key, netvisorData.customers[key]) for key in found]
+    body = customers[0] if len(customers) == 1 else E.Customers(*customers)
+    response = E.Root(generate_response_status(), body)
+    return Response(etree.tostring(response, pretty_print=True), content_type="text/html")
 
 
 @app.route("/getsalesinvoice.nv", methods=["GET"])
@@ -161,35 +217,154 @@ def post_salesinvoicestatus():
     return generate_inserted_data_response(netvisor_key)
 
 
+# Netvisor's default customer group, as the sandbox lists it for every customer.
+DEFAULT_CUSTOMER_GROUP = ("1", "Asiakasryhmä 1")
+
+
+def customer_code(customer, key):
+    """The imported <internalidentifier>; the sandbox shows the Netvisor key as code when none was given."""
+    return text_of(customer.get("internalidentifier")) or key
+
+
 def generate_customer_element(customer, key):
-    """One customerlist.nv <Customer>; Code is the customer code imported as <internalidentifier>."""
+    """One customerlist.nv <Customer>, in the sandbox's element order."""
     return E.Customer(
         E.Netvisorkey(key),
         E.Name(text_of(customer.get("name"))),
-        E.Code(text_of(customer.get("internalidentifier"))),
+        E.Code(customer_code(customer, key)),
         E.OrganisationIdentifier(text_of(customer.get("externalidentifier"))),
-        E.CustomerGroupID(""),
-        E.CustomerGroupName(text_of(customer.get("customergroupname"))),
+        E.CustomerGroupID(DEFAULT_CUSTOMER_GROUP[0]),
+        E.CustomerGroupName(text_of(customer.get("customergroupname")) or DEFAULT_CUSTOMER_GROUP[1]),
         E.Uri(f"{BASE_URL}/getcustomer.nv?id={key}"),
     )
 
 
-# customerlist.nv searches name, customer code, business ID and name extension for "keyword*".
+def generate_customer_details(key, stored):
+    """One getcustomer.nv <Customer> with the sections and element names the sandbox returned on 2026-11-05."""
+    base = stored.get("customerbaseinformation") or {}
+    finvoice = stored.get("customerfinvoicedetails") or {}
+    delivery = stored.get("customerdeliverydetails") or {}
+    contact = stored.get("customercontactdetails") or {}
+    additional = stored.get("customeradditionalinformation") or {}
+
+    def fields(source, mapping):
+        return [getattr(E, tag)(text_of(source.get(field))) for tag, field in mapping]
+
+    return E.Customer(
+        E.CustomerBaseInformation(
+            E.NetvisorKey(key),
+            E.InternalIdentifier(customer_code(base, key)),
+            E.ExternalIdentifier(text_of(base.get("externalidentifier"))),
+            E.OrganizationUnitNumber(text_of(base.get("organizationunitnumber"))),
+            E.CustomerGroupNetvisorKey(DEFAULT_CUSTOMER_GROUP[0]),
+            E.CustomerGroupName(text_of(base.get("customergroupname")) or DEFAULT_CUSTOMER_GROUP[1]),
+            *fields(
+                base,
+                [
+                    ("Name", "name"),
+                    ("NameExtension", "nameextension"),
+                    ("StreetAddress", "streetaddress"),
+                    ("AdditionalStreetAddress", "additionaladdressline"),
+                    ("City", "city"),
+                    ("PostNumber", "postnumber"),
+                ],
+            ),
+            E.Country(text_of(base.get("country")) or "FI", type="ISO-3166"),
+            *fields(
+                base,
+                [
+                    ("PhoneNumber", "phonenumber"),
+                    ("FaxNumber", "faxnumber"),
+                    ("Email", "email"),
+                    ("EmailInvoicingAddress", "emailinvoicingaddress"),
+                    ("HomePageUri", "homepageuri"),
+                ],
+            ),
+            E.IsActive(text_of(base.get("isactive")) or "1"),
+            E.IsPrivateCustomer(text_of(base.get("isprivatecustomer")) or "0"),
+        ),
+        E.CustomerFinvoiceDetails(
+            *fields(finvoice, [("FinvoiceAddress", "finvoiceaddress"), ("FinvoiceRouterCode", "finvoiceroutercode")])
+        ),
+        E.CustomerDeliveryDetails(
+            *fields(
+                delivery,
+                [
+                    ("DeliveryName", "deliveryname"),
+                    ("DeliveryStreetAddress", "deliverystreetaddress"),
+                    ("DeliveryCity", "deliverycity"),
+                    ("DeliveryPostNumber", "deliverypostnumber"),
+                ],
+            )
+        ),
+        E.CustomerContactDetails(
+            *fields(
+                contact,
+                [
+                    ("ContactPerson", "contactperson"),
+                    ("ContactPersonEmail", "contactpersonemail"),
+                    ("ContactPersonPhone", "contactpersonphone"),
+                ],
+            )
+        ),
+        E.CustomerContactPersons(),
+        E.CustomerAdditionalInformation(
+            *fields(
+                additional,
+                [
+                    ("Comment", "comment"),
+                    ("CustomerAgreementIdentifier", "customeragreementidentifier"),
+                    ("ReferenceNumber", "customerreferencenumber"),
+                ],
+            ),
+            E.UseCreditorReferenceNumber("0"),
+            E.UseOrderReferenceNumber("0"),
+            *fields(
+                additional,
+                [
+                    ("YourDefaultReference", "yourdefaultreference"),
+                    ("DefaultTextBeforeInvoiceLines", "defaulttextbeforeinvoicelines"),
+                    ("DefaultTextAfterInvoiceLines", "defaulttextafterinvoicelines"),
+                ],
+            ),
+            E.TaxHandlingType("countrygroup"),
+            E.BalanceLimit(),
+            E.DiscountPercentage(),
+            E.PriceGroup(),
+            E.FactoringAccount(),
+            E.InvoicingLanguage(text_of(additional.get("invoicinglanguage")) or "FI", type="ISO-3166"),
+            E.EUStandardFinvoice("0"),
+            E.InCollectionProhibitation("0"),
+        ),
+    )
+
+
+# customerlist.nv keyword: the sandbox matches a case-insensitive substring of name, customer code, business ID
+# and name extension (e.g. "ridian", "meri" and "4567" all find "Merenkulku Meridian Ab", 1234567-8).
 CUSTOMERLIST_KEYWORD_FIELDS = ("name", "internalidentifier", "externalidentifier", "nameextension")
 
 
-def matches_keyword(customer, keyword: str | None) -> bool:
+def matches_keyword(customer, key, keyword: str | None) -> bool:
     if not keyword:
         return True
-    return any(text_of(customer.get(field)).startswith(keyword) for field in CUSTOMERLIST_KEYWORD_FIELDS)
+    values = [text_of(customer.get(field)) for field in CUSTOMERLIST_KEYWORD_FIELDS] + [customer_code(customer, key)]
+    return any(keyword.casefold() in value.casefold() for value in values)
 
 
-def generate_customerlist_response(keyword: str | None) -> Response:
+def changed_since_matches(key, changed_since: str | None) -> bool:
+    if changed_since is None:
+        return True
+    changed = netvisorData.customer_changed.get(key)
+    # A customer stored before change times were recorded is treated as changed, so a sync never misses it.
+    return changed is None or changed >= changed_since
+
+
+def generate_customerlist_response(keyword: str | None, changed_since: str | None = None) -> Response:
     """Create mock response for GET customerlist.nv -request."""
     customer_list = [
         generate_customer_element(value["customerbaseinformation"], key)
         for key, value in netvisorData.customers.items()
-        if matches_keyword(value["customerbaseinformation"], keyword)
+        if matches_keyword(value["customerbaseinformation"], key, keyword) and changed_since_matches(key, changed_since)
     ]
 
     response = E.Root(E.ResponseStatus(E.Status("OK"), E.TimeStamp(create_timestamp())), E.Customerlist(*customer_list))
