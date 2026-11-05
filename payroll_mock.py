@@ -9,13 +9,10 @@ from threading import Lock
 from flask import Blueprint, Response, jsonify, request
 from lxml import etree
 
-
 payroll = Blueprint("payroll", __name__)
 _lock = Lock()
 _contexts = {}
-_scenarios = {
-    "success", "business_rejection", "auth_rejection", "ambiguous", "server_failure", "timeout"
-}
+_scenarios = {"success", "business_rejection", "auth_rejection", "ambiguous", "server_failure", "timeout"}
 _partner_id = os.environ.get("NETVISOR_MOCK_PARTNER_ID", "gisgro-test-partner")
 _partner_key = os.environ.get("NETVISOR_MOCK_PARTNER_KEY", "gisgro-test-partner-key")
 _sender = os.environ.get("NETVISOR_MOCK_SENDER", "GISGRO")
@@ -36,8 +33,16 @@ _auth_headers = (
 
 
 def _context(org_id):
-    return _contexts.setdefault(org_id, {"scenario": "success", "ratioNumbers": ["1234"],
-                                         "userKey": _default_user_key, "sender": _sender, "requests": []})
+    return _contexts.setdefault(
+        org_id,
+        {
+            "scenario": "success",
+            "ratioNumbers": ["1234"],
+            "userKey": _default_user_key,
+            "sender": _sender,
+            "requests": [],
+        },
+    )
 
 
 def _xml(status="OK", message=None, identifier=None, http_status=200):
@@ -102,8 +107,7 @@ def _authenticated():
 
 
 def _auth_failure():
-    return _xml("FAILED", "AUTHENTICATION_FAILED :: Integration credentials are invalid",
-                http_status=401)
+    return _xml("FAILED", "AUTHENTICATION_FAILED :: Integration credentials are invalid", http_status=401)
 
 
 def _query_is(expected):
@@ -116,8 +120,7 @@ def _required(parent, name, attribute=None, allowed=None):
     element = parent.find(name)
     if element is None or not (element.text or "").strip():
         raise ValueError("Missing " + name)
-    if attribute and (not element.get(attribute) or
-                      (allowed and element.get(attribute) not in allowed)):
+    if attribute and (not element.get(attribute) or (allowed and element.get(attribute) not in allowed)):
         raise ValueError("Invalid " + name + " " + attribute)
     if allowed and not attribute and element.text.strip() not in allowed:
         raise ValueError("Invalid " + name)
@@ -129,7 +132,7 @@ def _number(text):
         if not Decimal(text).is_finite():
             raise ValueError("Non-finite amount")
     except InvalidOperation:
-        raise ValueError("Invalid amount")
+        raise ValueError("Invalid amount") from None
 
 
 def _validate_dimensions(line):
@@ -144,7 +147,7 @@ def _validate_xml(resource):
     try:
         root = etree.fromstring(request.data, parser=etree.XMLParser(resolve_entities=False, no_network=True))
     except etree.XMLSyntaxError:
-        raise ValueError("Invalid XML document")
+        raise ValueError("Invalid XML document") from None
     if root.tag != "root" or len(root) != 1 or root[0].tag != resource:
         raise ValueError("Invalid resource root")
     data = root[0]
@@ -154,9 +157,8 @@ def _validate_xml(resource):
     try:
         date.fromisoformat(date_element.text.strip())
     except ValueError:
-        raise ValueError("Invalid date")
-    _required(data, "employeeidentifier", "type", {"number", "personalidentificationnumber",
-                                                     "netvisorkey"})
+        raise ValueError("Invalid date") from None
+    _required(data, "employeeidentifier", "type", {"number", "personalidentificationnumber", "netvisorkey"})
     if resource == "payrollperiodcollector":
         lines = data.findall("payrollratioline")
         if not lines:
@@ -182,7 +184,7 @@ def _validate_xml(resource):
 def _record_post(org_id):
     safe_query = {
         name: request.args.get(name) if name in {"method", "useonlyexistingdimensions"} else "<redacted>"
-        for name in request.args.keys()
+        for name in request.args
     }
     entry = {
         "path": request.path,
@@ -284,7 +286,7 @@ def _post(resource):
         return _xml("FAILED", "TECHNICAL_ERROR :: Provider unavailable", http_status=503)
     if scenario == "timeout":
         return _xml("FAILED", "TECHNICAL_ERROR :: Request timed out", http_status=408)
-    identifier = "mock-%s" % sequence if resource == "payrollperiodcollector" else None
+    identifier = f"mock-{sequence}" if resource == "payrollperiodcollector" else None
     return _xml(identifier=identifier)
 
 

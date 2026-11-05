@@ -2,3 +2,5 @@
 __pycache__
 *.pyc
 test_payroll.py
+.venv
+.ruff_cache

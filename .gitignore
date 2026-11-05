@@ -2,3 +2,6 @@ data.json
 .idea
 __pycache__
 *.py[co]
+.venv
+.ruff_cache
+data.json.tmp
