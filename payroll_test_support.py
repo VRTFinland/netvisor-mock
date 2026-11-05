@@ -84,12 +84,23 @@ class PayrollServerTestCase(unittest.TestCase):
             "X-Netvisor-Interface-Language": "EN",
         }
 
-    def configure(self, org, scenario, ratio_numbers=None, user_key=None, sender=None, rejection_message=None):
+    def configure(
+        self,
+        org,
+        scenario,
+        ratio_numbers=None,
+        user_key=None,
+        sender=None,
+        rejection_message=None,
+        record_type_numbers=None,
+    ):
         body = {"scenario": scenario}
         if rejection_message is not None:
             body["rejectionMessage"] = rejection_message
         if ratio_numbers is not None:
             body["ratioNumbers"] = ratio_numbers
+        if record_type_numbers is not None:
+            body["recordTypeNumbers"] = record_type_numbers
         if user_key is not None:
             body["userKey"] = user_key
         if sender is not None:

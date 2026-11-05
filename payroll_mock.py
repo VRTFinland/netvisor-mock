@@ -30,6 +30,11 @@ _auth_headers = (
     "X-Netvisor-Interface-Language",
     "X-Netvisor-Organisation-ID",
 )
+# The salary type numbers of payrollratiolist.nv and the record type numbers of getrecordtypelist.nv. VRTfront's
+# payroll API specs send salary type 1234 and record type 4567 without configuring either list. None is a record
+# type without a number (<RatioNumber />), as Netvisor lists some of them.
+_DEFAULT_RATIO_NUMBERS = ("1234",)
+_DEFAULT_RECORD_TYPE_NUMBERS = ("4567", None)
 
 
 def _context(org_id):
@@ -37,7 +42,8 @@ def _context(org_id):
         org_id,
         {
             "scenario": "success",
-            "ratioNumbers": ["1234"],
+            "ratioNumbers": list(_DEFAULT_RATIO_NUMBERS),
+            "recordTypeNumbers": list(_DEFAULT_RECORD_TYPE_NUMBERS),
             "userKey": _default_user_key,
             "sender": _sender,
             "rejectionMessage": None,
@@ -58,6 +64,15 @@ def _xml(status="OK", message=None, identifier=None, http_status=200):
         replies = etree.SubElement(root, "Replies")
         etree.SubElement(replies, "InsertedDataIdentifier").text = identifier
     return Response(etree.tostring(root), status=http_status, content_type="application/xml")
+
+
+def _ok_root():
+    """A <Root> with an OK ResponseStatus, for the list responses to fill."""
+    root = etree.Element("Root")
+    status = etree.SubElement(root, "ResponseStatus")
+    etree.SubElement(status, "Status").text = "OK"
+    etree.SubElement(status, "TimeStamp").text = "09.10.2026 12:00:00"
+    return root
 
 
 def _invalid(message):
@@ -211,6 +226,7 @@ def configure_scenario(org_id):
     if not isinstance(payload, dict) or set(payload) - {
         "scenario",
         "ratioNumbers",
+        "recordTypeNumbers",
         "userKey",
         "sender",
         "rejectionMessage",
@@ -218,11 +234,12 @@ def configure_scenario(org_id):
         return jsonify(error="Invalid scenario configuration"), 400
     if payload.get("scenario") not in _scenarios:
         return jsonify(error="Unknown scenario"), 400
-    ratio_numbers = payload.get("ratioNumbers", ["1234"])
-    if not isinstance(ratio_numbers, list) or any(
-        not isinstance(number, str) or not number.strip() for number in ratio_numbers
-    ):
+    ratio_numbers = payload.get("ratioNumbers", list(_DEFAULT_RATIO_NUMBERS))
+    if not _is_number_list(ratio_numbers):
         return jsonify(error="Invalid ratioNumbers"), 400
+    record_type_numbers = payload.get("recordTypeNumbers", list(_DEFAULT_RECORD_TYPE_NUMBERS))
+    if not _is_number_list(record_type_numbers, allow_none=True):
+        return jsonify(error="Invalid recordTypeNumbers"), 400
     user_key = payload.get("userKey", _default_user_key)
     if not isinstance(user_key, str) or not user_key.strip():
         return jsonify(error="Invalid userKey"), 400
@@ -236,10 +253,20 @@ def configure_scenario(org_id):
         context = _context(org_id)
         context["scenario"] = payload["scenario"]
         context["ratioNumbers"] = ratio_numbers
+        context["recordTypeNumbers"] = record_type_numbers
         context["userKey"] = user_key
         context["sender"] = sender
         context["rejectionMessage"] = rejection_message
-    return jsonify(scenario=payload["scenario"], ratioNumbers=ratio_numbers)
+    return jsonify(scenario=payload["scenario"], ratioNumbers=ratio_numbers, recordTypeNumbers=record_type_numbers)
+
+
+def _is_number_list(value, allow_none=False):
+    """A list of non-blank strings XML can carry; with allow_none, None entries stand for rows without a number."""
+    return isinstance(value, list) and all(
+        (allow_none and number is None)
+        or (isinstance(number, str) and number.strip() and not _NON_XML_CHARACTERS.search(number))
+        for number in value
+    )
 
 
 @payroll.route("/__test__/payroll/<org_id>/requests", methods=["GET"])
@@ -264,16 +291,42 @@ def payroll_ratio_list():
         return _invalid("Unsupported payroll ratio list query")
     with _lock:
         numbers = list(_context(request.headers["X-Netvisor-Organisation-ID"])["ratioNumbers"])
-    root = etree.Element("Root")
-    status = etree.SubElement(root, "ResponseStatus")
-    etree.SubElement(status, "Status").text = "OK"
-    etree.SubElement(status, "TimeStamp").text = "09.10.2026 12:00:00"
+    root = _ok_root()
     ratios = etree.SubElement(root, "PayrollRatios")
     for index, number in enumerate(numbers, 1):
         ratio = etree.SubElement(ratios, "PayrollRatio")
         etree.SubElement(ratio, "Identifier").text = str(index)
         etree.SubElement(ratio, "Source").text = "collectorratiolines"
         etree.SubElement(ratio, "RatioNumber").text = number
+    return Response(etree.tostring(root), content_type="application/xml")
+
+
+# Shape pinned to the Netvisor sandbox on 2026-11-04: names in fi/en/sv, an empty <RatioNumber /> for a record
+# type without a number, and the RatioNumber is what workday.nv takes as collectorratio type="number".
+@payroll.route("/getrecordtypelist.nv", methods=["GET"])
+def record_type_list():
+    if not _authenticated():
+        return _auth_failure()
+    with _lock:
+        context = _context(request.headers["X-Netvisor-Organisation-ID"])
+        scenario = context["scenario"]
+        numbers = list(context["recordTypeNumbers"])
+    if scenario == "auth_rejection":
+        return _auth_failure()
+    if request.args:
+        return _invalid("Unsupported record type list query")
+    root = _ok_root()
+    record_types = etree.SubElement(root, "RecordTypes")
+    for key, number in enumerate(numbers, 1):
+        record_type = etree.SubElement(record_types, "RecordType")
+        names = etree.SubElement(record_type, "Names")
+        etree.SubElement(names, "Name", {"ISO639-1Code": "fi"}).text = f"Kirjauslaji {number or key}"
+        etree.SubElement(names, "Name", {"ISO639-1Code": "en"})
+        etree.SubElement(names, "Name", {"ISO639-1Code": "sv"})
+        etree.SubElement(record_type, "NetvisorKey").text = str(key)
+        etree.SubElement(record_type, "RatioNumber").text = number
+        etree.SubElement(record_type, "CharacterType").text = "1"
+        etree.SubElement(record_type, "UnitType").text = "1"
     return Response(etree.tostring(root), content_type="application/xml")
 
 
@@ -445,10 +498,7 @@ def get_employees():
         return _invalid("Unsupported employee list query")
     with _lock:
         employees = list(_context(request.headers["X-Netvisor-Organisation-ID"])["employees"])
-    root = etree.Element("Root")
-    status = etree.SubElement(root, "ResponseStatus")
-    etree.SubElement(status, "Status").text = "OK"
-    etree.SubElement(status, "TimeStamp").text = "09.10.2026 12:00:00"
+    root = _ok_root()
     listed = etree.SubElement(root, "employees")
     for employee in employees:
         if employee["employmentStatus"] == "0" and include_ended != "1":

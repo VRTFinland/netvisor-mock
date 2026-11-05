@@ -9,6 +9,7 @@ Functionality is limited to following endpoints:
 - [POST] /salesinvoice.nv
 - [POST] /updatesalesinvoicestatus.nv
 - [GET] /payrollratiolist.nv?source=collectorratiolines
+- [GET] /getrecordtypelist.nv
 - [POST] /payrollperiodcollector.nv?useonlyexistingdimensions=1
 - [POST] /workday.nv?useonlyexistingdimensions=1
 - [GET] /getemployees.nv?includeendedemployments=0|1
@@ -44,7 +45,8 @@ Set the corresponding
 or `NETVISOR_MOCK_USER_KEY` environment variable to change them.
 
 The test-only `PUT /__test__/payroll/<organisation-id>/scenario` endpoint accepts
-`{"scenario":"success","ratioNumbers":["1234"]}`. Available scenarios are
+`{"scenario":"success","ratioNumbers":["1234"],"recordTypeNumbers":["4567",null]}`
+(these lists are also the defaults). Available scenarios are
 `success`, `business_rejection`, `auth_rejection`, `ambiguous`, `server_failure`,
 and `timeout` (HTTP 408). Optional `userKey` and `sender` values change the
 fake organisation's authentication context. An optional `rejectionMessage` sets the
@@ -54,6 +56,13 @@ free text of `business_rejection`, which answers HTTP 400 with
 POST count and request path, query, XML body, and authentication header names.
 `DELETE /__test__/payroll/<organisation-id>` clears only that context. These
 controls do not affect invoice data or other organisations.
+
+`payrollratiolist.nv` lists `ratioNumbers` as salary types. `getrecordtypelist.nv` lists
+`recordTypeNumbers` as record types in the Netvisor sandbox shape (`Names` in fi/en/sv,
+`NetvisorKey`, `RatioNumber`, `CharacterType`, `UnitType`); a `null` entry is a record type
+without a number (`<RatioNumber />`), as Netvisor has. The `RatioNumber` is what `workday.nv`
+takes as `collectorratio type="number"`. `getrecordtypelist.nv` takes no query parameters and
+also answers `auth_rejection` with HTTP 401; the other scenarios affect only the POSTs.
 
 ### Payroll employees
 
