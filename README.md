@@ -75,16 +75,20 @@ $ make format              # fix lint findings and format
 
 ## Docker
 
-```
-$ make build               # vrtfinland/netvisor-mock:dev for this machine
-$ docker run -p 5001:5001 vrtfinland/netvisor-mock:dev
-```
-
-Publishing builds `linux/amd64` and `linux/arm64` with `docker buildx` and pushes them as one tag.
-It needs a builder with the `docker-container` driver and push access to `vrtfinland/netvisor-mock`.
-The target refuses an uncommitted tree or an existing tag:
+Images are tagged like the VRTfront microservices: the git tag without a `v` prefix
+(`git describe --tags --always`), or `DOCKER_TAG` when given.
 
 ```
-$ docker buildx create --name multiarch --driver docker-container   # once
-$ make publish TAG=6 BUILDER=multiarch
+$ make build                 # this machine's platform
+$ make start-image           # serves on port 5001
+```
+
+GISGRO runs amd64 in the cluster and arm64 on developers' Macs, so a published tag carries both.
+`buildx-build-push` runs `make check` first and refuses an uncommitted tree or a tag that already
+exists. It needs a Docker Hub login with write access to the `vrtfinland` organisation and a
+multi-platform buildx builder (`BUILDER=` picks one other than the current):
+
+```
+$ git tag 6 && git push origin 6
+$ make buildx-build-push     # vrtfinland/netvisor-mock:6, linux/amd64 + linux/arm64
 ```
