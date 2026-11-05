@@ -2,6 +2,8 @@ import json
 import unittest
 from uuid import uuid4
 
+from lxml import etree
+
 from payroll_test_support import PayrollServerTestCase
 
 COLLECTOR = b"""<root><payrollperiodcollector>
@@ -172,6 +174,82 @@ class PayrollRoutesTest(PayrollServerTestCase):
         self.assertEqual(self.call(f"/__test__/payroll/{first}", "DELETE", org=first)[0], 204)
         self.assertEqual(self.journal(first)["count"], 0)
         self.assertEqual(self.journal(second)["count"], 1)
+
+
+RECORD_TYPE_LIST = "/getrecordtypelist.nv"
+
+
+class RecordTypeListTest(PayrollServerTestCase):
+    def record_types(self, org):
+        status, body = self.call(RECORD_TYPE_LIST, org=org, headers=self.auth())
+        self.assertEqual(status, 200)
+        root = etree.fromstring(body)
+        self.assertEqual(root.findtext("ResponseStatus/Status"), "OK")
+        return root.findall("RecordTypes/RecordType")
+
+    def test_default_list_has_the_spec_record_type_and_one_without_a_number(self):
+        org = "record-types-default-" + uuid4().hex
+        numbered, numberless = self.record_types(org)
+        self.assertEqual(numbered.findtext("RatioNumber"), "4567")
+        self.assertEqual(numbered.findtext("NetvisorKey"), "1")
+        self.assertEqual([name.get("ISO639-1Code") for name in numbered.findall("Names/Name")], ["fi", "en", "sv"])
+        self.assertTrue(numbered.findtext("Names/Name"))
+        self.assertEqual(numbered.findtext("CharacterType"), "1")
+        self.assertEqual(numbered.findtext("UnitType"), "1")
+        self.assertIsNotNone(numberless.find("RatioNumber"))
+        self.assertIsNone(numberless.find("RatioNumber").text)
+        self.assertEqual(numberless.findtext("NetvisorKey"), "2")
+
+    def test_record_type_numbers_scenario_replaces_only_the_record_type_list(self):
+        org = "record-types-scenario-" + uuid4().hex
+        status, body = self.configure(org, "success", record_type_numbers=["1010", None, "2020"])
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["recordTypeNumbers"], ["1010", None, "2020"])
+        self.assertEqual([item.findtext("RatioNumber") for item in self.record_types(org)], ["1010", "", "2020"])
+        status, body = self.call("/payrollratiolist.nv?source=collectorratiolines", org=org, headers=self.auth())
+        self.assertEqual(status, 200)
+        self.assertIn(b"<RatioNumber>1234</RatioNumber>", body)
+        self.assertEqual(len(self.record_types("record-types-other-" + uuid4().hex)), 2)
+        self.assertEqual(self.configure(org, "success")[0], 200)
+        self.assertEqual([item.findtext("RatioNumber") for item in self.record_types(org)], ["4567", ""])
+
+    def test_lists_without_numbered_record_types(self):
+        org = "record-types-numberless-" + uuid4().hex
+        self.assertEqual(self.configure(org, "success", record_type_numbers=[None])[0], 200)
+        (numberless,) = self.record_types(org)
+        self.assertIsNone(numberless.find("RatioNumber").text)
+        self.assertEqual(self.configure(org, "success", record_type_numbers=[])[0], 200)
+        self.assertEqual(self.record_types(org), [])
+
+    def test_rejects_invalid_record_type_numbers(self):
+        org = "record-types-invalid-" + uuid4().hex
+        for numbers in ("4567", [""], [" "], [4567], ["45\x0067"]):
+            status, body = self.configure(org, "success", record_type_numbers=numbers)
+            self.assertEqual(status, 400, numbers)
+            self.assertIn(b"Invalid recordTypeNumbers", body)
+        self.assertEqual(self.configure(org, "success", ratio_numbers=[None])[0], 400)
+
+    def test_authentication_failures_and_auth_rejection_scenario(self):
+        org = "record-types-auth-" + uuid4().hex
+        status, body = self.call(RECORD_TYPE_LIST, org=org)
+        self.assertEqual(status, 401)
+        self.assertIn(b"AUTHENTICATION_FAILED", body)
+        status, body = self.call(
+            RECORD_TYPE_LIST, org=org, headers={**self.auth(), "X-Netvisor-Authentication-MAC": "0" * 64}, sign=False
+        )
+        self.assertEqual(status, 401)
+        self.assertIn(b"AUTHENTICATION_FAILED", body)
+        self.assertEqual(self.configure(org, "auth_rejection")[0], 200)
+        status, body = self.call(RECORD_TYPE_LIST, org=org, headers=self.auth())
+        self.assertEqual(status, 401)
+        self.assertIn(b"AUTHENTICATION_FAILED", body)
+        self.assertEqual(self.journal(org)["count"], 0)
+
+    def test_rejects_a_query(self):
+        org = "record-types-query-" + uuid4().hex
+        status, body = self.call(RECORD_TYPE_LIST + "?source=collectorratiolines", org=org, headers=self.auth())
+        self.assertEqual(status, 400)
+        self.assertIn(b"INVALID_DATA", body)
 
 
 if __name__ == "__main__":
