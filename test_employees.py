@@ -41,6 +41,22 @@ NEW_EMPLOYEE = """<root><employee>
 </employee></root>"""
 
 
+# As VRTfront sends a foreign employee and the sandbox accepted it on 2026-11-18: no nationality.
+FOREIGN_IDENTIFICATION = """<foreignemployeeidentification>
+            <identifier type="{type}">{identifier}</identifier>
+            <issuingcountry type="ISO-3166">{country}</issuingcountry>
+            <gender>female</gender>
+            <dateofbirth format="ansi">1990-05-17</dateofbirth>
+        </foreignemployeeidentification>"""
+
+
+def foreign_employee(identifier="SYNTH0000000211", country="SE", number="211", type="foreignpersonalidentifier"):
+    foreign = FOREIGN_IDENTIFICATION.format(type=type, identifier=identifier, country=country)
+    return new_employee(number=number).replace(
+        b"<employeeidentifier>020290-901B</employeeidentifier>", foreign.encode()
+    )
+
+
 def new_employee(identity="020290-901B", number="100") -> bytes:
     return NEW_EMPLOYEE.format(identity=identity, number=number).encode()
 
@@ -171,6 +187,65 @@ class EmployeesTest(PayrollServerTestCase):
             self.assertEqual(status, 400, (query, body[:80]))
             self.assertIn(b"INVALID_DATA", response)
         self.assertEqual(len(self.list_employees()), 2)
+
+    def test_foreign_employee_is_added_and_listed_without_a_personal_id(self):
+        status, body = self.add(foreign_employee())
+
+        self.assertEqual(status, 200, body)
+        self.assertEqual(statuses(body), ["OK"])
+        added = [e for e in self.list_employees() if e.findtext("employeenumber") == "211"]
+        self.assertEqual(len(added), 1)
+        self.assertEqual(added[0].findtext("netvisorkey"), "20")
+        self.assertIsNone(added[0].find("personalid"))
+
+    def test_two_foreign_employees_are_not_taken_for_the_same_person(self):
+        self.assertEqual(self.add(foreign_employee())[0], 200)
+        self.assertEqual(self.add(foreign_employee(identifier="SYNTH0000000212", number="212"))[0], 200)
+
+        self.assertEqual(len(self.list_employees()), 4)
+
+    def test_issuing_country_must_be_an_upper_case_alpha_2_code(self):
+        for country in ("SWE", "se"):
+            status, body = self.add(foreign_employee(country=country))
+
+            self.assertEqual(status, 400)
+            self.assertEqual(
+                statuses(body),
+                [
+                    "FAILED",
+                    "INVALID_DATA :: Data form incorrect:. No country was found. "
+                    f"Check that the country code is a valid ISO3166 code. :: {country}",
+                ],
+            )
+        self.assertEqual(len(self.list_employees()), 2)
+
+    def test_invalid_foreign_identifications_are_rejected_as_invalid_data(self):
+        both = foreign_employee().replace(
+            b"<firstname>", b"<employeeidentifier>020290-901B</employeeidentifier><firstname>"
+        )
+        invalid = [
+            both,
+            foreign_employee(type="passport"),
+            foreign_employee().replace(b"<gender>female</gender>", b"<gender>other</gender>"),
+            foreign_employee().replace(b"<gender>female</gender>", b""),
+            foreign_employee().replace(b'<dateofbirth format="ansi">1990-05-17</dateofbirth>', b""),
+            foreign_employee().replace(b"1990-05-17", b"17.5.1990"),
+            foreign_employee().replace(b' type="ISO-3166"', b""),
+        ]
+        for body in invalid:
+            status, response = self.add(body)
+            self.assertEqual(status, 400, body[:200])
+            self.assertIn(b"INVALID_DATA", response)
+        self.assertEqual(len(self.list_employees()), 2)
+
+    def test_journal_records_foreign_posts_without_the_identifier(self):
+        self.add(foreign_employee())
+
+        journal = self.journal(self.org)
+        self.assertIn(
+            '<identifier type="foreignpersonalidentifier">[redacted]</identifier>', journal["requests"][0]["body"]
+        )
+        self.assertNotIn("SYNTH0000000211", json.dumps(journal))
 
     def test_journal_records_posts_without_identity_codes(self):
         self.add(new_employee())

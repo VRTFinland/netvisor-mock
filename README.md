@@ -85,7 +85,8 @@ The resources behave as the Netvisor sandbox did on 2026-11-04:
   `personalid`, `firstname`, `lastname`, `realname`, `employmentstatus`, `payrollservice`,
   `resourcemanagement` and `lunchbenefit`. Ended employments are left out unless
   `includeendedemployments=1`.
-- `employee.nv?method=add` requires `employeeidentifier`, `firstname`, `lastname`,
+- `employee.nv?method=add` requires `employeeidentifier` or `foreignemployeeidentification`
+  (not both), `firstname`, `lastname`,
   `streetaddress`, `postnumber`, `city`, `payrollrulegroupname` and at least one
   `employmentperiod` with `startdate format="ansi"` and `profession`. A success answers
   `ResponseStatus` OK without `InsertedDataIdentifier`; the employee gets the next free
@@ -95,10 +96,16 @@ The resources behave as the Netvisor sandbox did on 2026-11-04:
   `INVALID_DATA :: Data form incorrect:. Employee information already exists: 010180-xxxx`
   (masked like Netvisor). An existing employee number answers HTTP 400
   `INVALID_DATA :: Data form incorrect:. Employee number already in use: <number>`.
+- A `foreignemployeeidentification` needs `identifier` with `type` `taxidentificationnumber`,
+  `foreignpersonalidentifier` or `other`, `issuingcountry type="ISO-3166"`, `gender` `male`
+  or `female` and `dateofbirth format="ansi"`. The issuing country must be an upper-case
+  alpha-2 code; anything else answers HTTP 400
+  `INVALID_DATA :: Data form incorrect:. No country was found. Check that the country code is a valid ISO3166 code. :: <code>`,
+  as the sandbox did for `SWE` and `se`. A foreign employee is listed without `personalid`.
 - The scenarios apply to `employee.nv` as to the other payroll POSTs.
 
 The request journal never shows an identity code: it replaces every `employee.nv`
-`employeeidentifier`, and every `type="personalidentificationnumber"` one in `workday.nv` and
+`employeeidentifier` and foreign `identifier`, and every `type="personalidentificationnumber"` one in `workday.nv` and
 `payrollperiodcollector.nv`, with `[redacted]`. A body that does not parse but mentions an
 employee identifier is withheld entirely.
 

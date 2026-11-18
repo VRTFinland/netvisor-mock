@@ -415,7 +415,8 @@ def _journal_body(body, only_type=None):
     """The body as journaled: <employeeidentifier> values replaced by [redacted] (only those of `only_type` when
     given). The XML is parsed, so CDATA, namespaces or odd spacing cannot hide a code; a body that does not parse
     but mentions an employee identifier is withheld entirely."""
-    if "employeeidentifier" not in body.lower():
+    lowered = body.lower()
+    if "employeeidentifier" not in lowered and "foreignemployeeidentification" not in lowered:
         return body
     try:
         root = etree.fromstring(body.encode(), parser=etree.XMLParser(resolve_entities=False, no_network=True))
@@ -423,7 +424,16 @@ def _journal_body(body, only_type=None):
         return _WITHHELD_BODY
     redacted = False
     for element in root.iter():
-        if not isinstance(element.tag, str) or etree.QName(element).localname.lower() != "employeeidentifier":
+        if not isinstance(element.tag, str):
+            continue
+        name = etree.QName(element).localname.lower()
+        parent = element.getparent()
+        foreign = (
+            name == "identifier"
+            and parent is not None
+            and etree.QName(parent).localname.lower() == "foreignemployeeidentification"
+        )
+        if name != "employeeidentifier" and not foreign:
             continue
         if only_type is None or element.get("type") == only_type:
             element.text = "[redacted]"
@@ -532,7 +542,14 @@ def _parse_employee():
     payroll_information = employee.find("employeepayrollinformation")
     if base is None or payroll_information is None:
         raise ValueError("Missing employeebaseinformation or employeepayrollinformation")
-    for name in ("employeeidentifier", "firstname", "lastname"):
+    foreign = base.find("foreignemployeeidentification")
+    if (base.find("employeeidentifier") is None) == (foreign is None):
+        raise ValueError("Give either employeeidentifier or foreignemployeeidentification")
+    if foreign is None:
+        _required(base, "employeeidentifier")
+    else:
+        _validate_foreign_identification(foreign)
+    for name in ("firstname", "lastname"):
         _required(base, name)
     for name in ("streetaddress", "postnumber", "city", "payrollrulegroupname"):
         _required(payroll_information, name)
@@ -553,17 +570,33 @@ def _parse_employee():
             raise ValueError("Invalid startdate") from None
         _required(period, "profession")
     return {
-        "personalId": base.findtext("employeeidentifier").strip(),
+        "personalId": base.findtext("employeeidentifier").strip() if foreign is None else None,
         "firstName": base.findtext("firstname").strip(),
         "lastName": base.findtext("lastname").strip(),
         "employeeNumber": number,
     }
 
 
+def _validate_foreign_identification(foreign):
+    """Netvisor accepted SE and refused SWE and se in the sandbox on 2026-11-18."""
+    _required(foreign, "identifier", "type", {"taxidentificationnumber", "foreignpersonalidentifier", "other"})
+    country = _required(foreign, "issuingcountry", "type", {"ISO-3166"}).text.strip()
+    if not re.fullmatch(r"[A-Z]{2}", country):
+        raise ValueError(
+            "Data form incorrect:. No country was found. Check that the country code is a valid ISO3166 code. :: "
+            + country
+        )
+    _required(foreign, "gender", allowed={"male", "female"})
+    try:
+        date.fromisoformat(_required(foreign, "dateofbirth", "format", {"ansi"}).text.strip())
+    except ValueError:
+        raise ValueError("Invalid dateofbirth") from None
+
+
 def _accept_employee(org_id, new, _sequence):
     with _lock:
         employees = _context(org_id)["employees"]
-        if any(employee["personalId"] == new["personalId"] for employee in employees):
+        if new["personalId"] and any(employee["personalId"] == new["personalId"] for employee in employees):
             message = f"Employee information already exists: {_masked_identity_code(new['personalId'])}"
             return _invalid("Data form incorrect:. " + message)
         if new["employeeNumber"] and any(employee["employeeNumber"] == new["employeeNumber"] for employee in employees):
